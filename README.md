@@ -194,11 +194,6 @@ Python are listed with the reason and left out - nothing is written half-convert
 values (the original bytes) can be read straight from the running game. Files are named
 `TITLEID_VERSION.ext` as the cheat menus expect.
 
-### Cheat Player
-
-`cheat_player/` is a separate, simpler app that only plays cheats (no scanner or debugger) for people
-who just want to use cheats. Build it with `cheat_player\build_player.bat`.
-
 ## Building the .exe
 
 ```bat
@@ -234,7 +229,7 @@ the icon, and on the first build copies your `cheats`, `tables`, `scripts`, `poi
 The tool works with the stock ps5debug-NG payload. One extra command, **pointer-scan level
 (`0xBDAACC30`)**, makes pointer scans run on the console; it is submitted upstream as a pull request.
 Until a payload has it, the tool detects that it is missing (CAPS bit `TSE_POINTER_SCAN`) and uses
-turbo scans instead.
+turbo scans instead. or use the payload on https://github.com/alfizari/ps5debug-NG
 
 ## Credits
 
