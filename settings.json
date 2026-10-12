@@ -1,0 +1,28 @@
+{
+  "ip": "192.168.100.15",
+  "port": 744,
+  "theme": "dark",
+  "safe_calls": true,
+  "call_gap_ms": 150,
+  "geometry": "1360x900+64+64",
+  "ptrscan": {
+    "level": "5",
+    "off": "800",
+    "last": "10000",
+    "nodes": "1000000",
+    "mods": "",
+    "max": "50000",
+    "skip_slow": true,
+    "readonly": false,
+    "vtype": "4 Bytes",
+    "mode": "targeted",
+    "scans": "8",
+    "alias": true,
+    "bss": true
+  },
+  "ptrscan_geom": "1304x991+202+103",
+  "script_geom": "1534x720+126+142",
+  "script_last": "# ps5 = the running game (see the API list on the right).  F5 runs, Esc stops.\nbase = ps5.module()                       # eboot.bin\nps5.log(\"game base\", base)\n\n# follow a pointer chain and change a value\n# hp = ps5.pointer(base + 0x4A1C00, 0x20, 0x1C4)\n# ps5.write_u32(hp, 999, undo=True)\n\n# find code by AOB, allocate a buffer, call a game function\n# site = ps5.aob(\"48 8B 05 ?? ?? ?? ?? 8B 40 1C\")\n# buf = ps5.alloc(\"stats\", 64, init=bytes([99]) * 64)\n# ps5.call(base + 0x123450, buf, 64)\n",
+  "funclog_geom": "1240x620+273+96",
+  "author": "Alfazari911"
+}
