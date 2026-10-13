@@ -29,7 +29,7 @@ from debugger_core import (
 )
 from disasm import K_CALL, Insn
 from disasm_view import DisasmView
-from scrollable import ScrollFrame
+from scrollable import ScrollFrame, fit_geometry
 from ps5debug_client import ProtocolError
 import theme  # noqa: E402
 
@@ -157,36 +157,23 @@ class DebuggerTab:
         ttk.Button(gb, text="Go", width=5, command=self.on_view_go).pack(side="left", padx=2)
         ttk.Button(gb, text="Go to RIP", command=self.on_view_rip).pack(side="left", padx=2)
 
-        bpf = ttk.LabelFrame(left, text="Breakpoints / watchpoints", padding=4)
-        bpf.pack(side="bottom", fill="x", pady=(4, 0))
-        self.bp_tree = ttk.Treeview(
-            bpf, columns=("slot", "type", "addr", "where", "on", "hits"), show="headings", height=5,
-            style="Dbg.Treeview", selectmode="browse",
-        )
-        for col, title, w in (("slot", "#", 34), ("type", "Type", 90), ("addr", "Address", 140),
-                              ("where", "Location", 190), ("on", "On", 70), ("hits", "Hits", 50)):
-            self.bp_tree.heading(col, text=title)
-            self.bp_tree.column(col, width=w, minwidth=30, stretch=(col == "where"))
-        bps = ttk.Scrollbar(bpf, orient="vertical", command=self.bp_tree.yview)
-        self.bp_tree.configure(yscrollcommand=bps.set)
-        self.bp_tree.grid(row=0, column=0, sticky="nsew")
-        bps.grid(row=0, column=1, sticky="ns")
-        bpf.grid_columnconfigure(0, weight=1)
-        self.bp_tree.bind("<Double-1>", lambda ev: self.on_bp_toggle_enabled())
-        bb = ttk.Frame(bpf)
-        bb.grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
-        ttk.Button(bb, text="Add breakpoint...", command=self.on_add_bp).pack(side="left", padx=2)
-        ttk.Button(bb, text="Add watchpoint...", command=self.on_add_wp).pack(side="left", padx=2)
-        ttk.Button(bb, text="Enable / disable", command=self.on_bp_toggle_enabled).pack(side="left", padx=2)
-        ttk.Button(bb, text="Remove", command=self.on_bp_remove).pack(side="left", padx=2)
-        ttk.Button(bb, text="Remove all", command=self.on_bp_remove_all).pack(side="left", padx=2)
-
+        # code view above, breakpoints below, with a draggable divider; the breakpoints can also
+        # be popped out into their own window (and docked back)
+        lsplit = tk.PanedWindow(left, orient="vertical", sashwidth=7, sashrelief="raised", bd=0)
+        lsplit.pack(fill="both", expand=True)
+        self._lsplit = lsplit
         self.view = DisasmView(
-            left, on_follow=self._follow, menu_items=self._menu, on_toggle_bp=lambda i: self.toggle_bp(i.addr),
-            height=16,
+            lsplit, on_follow=self._follow, menu_items=self._menu, on_toggle_bp=lambda i: self.toggle_bp(i.addr),
+            height=12,
         )
-        self.view.pack(fill="both", expand=True)
-
+        lsplit.add(self.view, minsize=120, stretch="always")
+        self._bp_win: Optional[tk.Toplevel] = None
+        self._bp_dock = ttk.Frame(lsplit)
+        lsplit.add(self._bp_dock, minsize=90, height=int(self.app.settings.get("dbg_bp_height", 250)),
+                   stretch="never")
+        self._bp_frame = self._build_bp_panel(self._bp_dock, docked=True)
+        if self.app.settings.get("dbg_bp_popout"):
+            self.app.root.after(300, self.pop_out_bps)
 
         # ---- right: registers + notebook
         regf = ttk.LabelFrame(right, text="Registers  (double-click: edit   right-click: copy / view in hex editor)",
@@ -400,7 +387,19 @@ class DebuggerTab:
             return
 
         def work() -> None:
-            self.client.debug_attach(pid)
+            wait = getattr(self.app, "_wait_teardown", None)
+            if wait:
+                wait()                      # a session that just ended must be fully closed first
+            try:
+                self.client.debug_attach(pid)
+            except ProtocolError as exc:
+                if "ALREADY" not in str(exc).upper() or not self.client.connected:
+                    raise
+                # the console is still closing an earlier session: give it time, then try once more
+                root.after(0, lambda: self.app.log_line("debugger: the console is still closing the last "
+                                                        "debug session - retrying in 2 s"))
+                time.sleep(2.0)
+                self.client.debug_attach(pid)
             self.pid = pid
             self.attached = True
             self.running = True
@@ -465,6 +464,7 @@ class DebuggerTab:
         self.app.log_line("debugger: the console ended the debug session. If commands now fail with a "
                           "connection error, press Disconnect and Connect again.")
         self._reset_state()
+        self.app._debug_dropped_at = time.monotonic()
         self._after_detach()
 
     def _after_detach(self) -> None:
@@ -747,6 +747,89 @@ class DebuggerTab:
         self._fill_bps()
         self._refresh_marks()
 
+    # ---- breakpoints panel (docked under the code, or in its own window)
+    def _build_bp_panel(self, parent, docked: bool) -> ttk.Frame:
+        bpf = ttk.LabelFrame(parent, text="Breakpoints / watchpoints", padding=4)
+        bpf.pack(fill="both", expand=True, pady=(4, 0) if docked else 0)
+        self.bp_tree = ttk.Treeview(
+            bpf, columns=("slot", "type", "addr", "where", "on", "hits"), show="headings", height=5,
+            style="Dbg.Treeview", selectmode="browse",
+        )
+        for col, title, w in (("slot", "#", 34), ("type", "Type", 90), ("addr", "Address", 140),
+                              ("where", "Location", 190), ("on", "On", 70), ("hits", "Hits", 50)):
+            self.bp_tree.heading(col, text=title)
+            self.bp_tree.column(col, width=w, minwidth=30, stretch=(col == "where"))
+        bps = ttk.Scrollbar(bpf, orient="vertical", command=self.bp_tree.yview)
+        self.bp_tree.configure(yscrollcommand=bps.set)
+        top = ttk.Frame(bpf)
+        top.pack(side="top", fill="x", pady=(0, 3))
+        ttk.Label(top, text="double-click a row: enable / disable", foreground=theme.c("muted")).pack(side="left")
+        if docked:
+            ttk.Button(top, text="Pop out \u29c9", style="Small.TButton", command=self.pop_out_bps).pack(side="right")
+        else:
+            ttk.Button(top, text="Dock back", style="Small.TButton", command=self.dock_bps).pack(side="right")
+        bb = ttk.Frame(bpf)
+        bb.pack(side="bottom", fill="x", pady=(4, 0))     # buttons first: never squeezed out
+        bps.pack(side="right", fill="y")
+        self.bp_tree.pack(side="left", fill="both", expand=True)
+        self.bp_tree.bind("<Double-1>", lambda ev: self.on_bp_toggle_enabled())
+        ttk.Button(bb, text="Add breakpoint...", command=self.on_add_bp).pack(side="left", padx=2)
+        ttk.Button(bb, text="Add watchpoint...", command=self.on_add_wp).pack(side="left", padx=2)
+        ttk.Button(bb, text="Enable / disable", command=self.on_bp_toggle_enabled).pack(side="left", padx=2)
+        ttk.Button(bb, text="Remove", command=self.on_bp_remove).pack(side="left", padx=2)
+        ttk.Button(bb, text="Remove all", command=self.on_bp_remove_all).pack(side="left", padx=2)
+        return bpf
+
+    def pop_out_bps(self) -> None:
+        """Move the breakpoints / watchpoints list into its own resizable window."""
+        if self._bp_win is not None:
+            self._bp_win.lift()
+            return
+        try:
+            self.app.settings["dbg_bp_height"] = max(90, self._bp_dock.winfo_height())
+        except tk.TclError:
+            pass
+        self._bp_frame.destroy()
+        self._lsplit.forget(self._bp_dock)
+        win = tk.Toplevel(self.app.root)
+        win.title("Breakpoints / watchpoints")
+        win.transient(self.app.root)
+        fit_geometry(win, 760, 360)
+        geo = self.app.settings.get("dbg_bp_geometry")
+        if geo:
+            try:
+                win.geometry(geo)
+            except tk.TclError:
+                pass
+        win.protocol("WM_DELETE_WINDOW", self.dock_bps)
+        self._bp_win = win
+        self._bp_frame = self._build_bp_panel(win, docked=False)
+        self._fill_bps()
+        self.app.settings["dbg_bp_popout"] = True
+
+    def remember_layout(self) -> None:
+        """Store the breakpoints panel size / window position in the settings (called on exit)."""
+        if self._bp_win is not None:
+            self.app.settings["dbg_bp_geometry"] = self._bp_win.geometry()
+        elif self._bp_dock.winfo_ismapped():
+            self.app.settings["dbg_bp_height"] = max(90, self._bp_dock.winfo_height())
+
+    def dock_bps(self) -> None:
+        """Put the breakpoints list back under the code view."""
+        if self._bp_win is None:
+            return
+        try:
+            self.app.settings["dbg_bp_geometry"] = self._bp_win.geometry()
+        except tk.TclError:
+            pass
+        self._bp_win.destroy()
+        self._bp_win = None
+        self._lsplit.add(self._bp_dock, minsize=90, height=int(self.app.settings.get("dbg_bp_height", 250)),
+                         stretch="never")
+        self._bp_frame = self._build_bp_panel(self._bp_dock, docked=True)
+        self._fill_bps()
+        self.app.settings["dbg_bp_popout"] = False
+
     def _fill_bps(self) -> None:
         self.bp_tree.delete(*self.bp_tree.get_children())
         for i, b in enumerate(self.bps):
@@ -1012,7 +1095,7 @@ class DebuggerTab:
         if insns is None:
             insns = []
             try:
-                insns, _ = disasm.disassemble(client, pid, rip, 0x400, 64, overrides)
+                insns, _ = disasm.disassemble_around(client, pid, rip, overrides=overrides)
                 self._code_cache, self._code_key = insns, tuple(sorted(overrides.items()))
             except Exception as exc:
                 self._code_cache = []
@@ -1767,7 +1850,7 @@ class DebuggerTab:
         overrides = self.bp_overrides()
 
         def work() -> None:
-            insns, _ = disasm.disassemble(self.client, pid, addr, 0x400, 64, overrides)
+            insns, _ = disasm.disassemble_around(self.client, pid, addr, overrides=overrides)
             self.app.root.after(0, lambda: self._show_code(addr, insns))
 
         self.app._run_bg(work, "Disassembling...")

@@ -275,3 +275,85 @@ def func_start_in(data: bytes, base: int, addr: int) -> Optional[int]:
                 return p
         p -= 16
     return None
+
+
+# ------------------------------------------------------------------ context before an address
+def _boundaries_to(data: bytes, base: int, start: int, target: int) -> Optional[list[int]]:
+    """Instruction start addresses from `start` up to `target`, or None if the strict decode does not
+    land exactly on `target` (bad bytes, or it runs over it)."""
+    if _cs is None:
+        return None
+    _lands_on(b"", 0, 0)                                  # make sure _MD_STRICT exists
+    out = []
+    pos = start
+    try:
+        for ins in _MD_STRICT.disasm(data[start - base:target - base], start):
+            out.append(ins.address)
+            pos = ins.address + ins.size
+            if pos >= target:
+                break
+    except Exception:
+        return None
+    return out if pos == target else None
+
+
+def context_start(data: bytes, base: int, addr: int, max_insns: int = 24) -> int:
+    """Where to start decoding so that the code BEFORE `addr` shows correctly.  `data` = memory from
+    `base` (at least up to `addr`).  x86 cannot be decoded backwards, so: the function start when it
+    is close, else the instruction boundary that most decode attempts agree on."""
+    if addr <= base:
+        return addr
+    fs = func_start_in(data, base, addr)
+    if fs is not None and fs >= base:
+        b = _boundaries_to(data, base, fs, addr)
+        if b:
+            return b[max(0, len(b) - max_insns)]
+    votes: dict[int, int] = {}
+    streams = 0
+    for s in range(base, addr):
+        b = _boundaries_to(data, base, s, addr)
+        if not b:
+            continue
+        streams += 1
+        for x in b:
+            votes[x] = votes.get(x, 0) + 1
+    if not streams:
+        return addr
+    need = max(2, int(streams * 0.6))
+    agreed = sorted(x for x, n in votes.items() if n >= need)
+    if not agreed:
+        return addr
+    b = _boundaries_to(data, base, agreed[0], addr) or [addr]
+    return b[max(0, len(b) - max_insns)]
+
+
+def disassemble_around(client, pid: int, addr: int, before: int = 0x80, after: int = 0x400,
+                       max_before: int = 24, max_after: int = 64,
+                       overrides: Optional[dict[int, int]] = None) -> tuple[list[Insn], bool]:
+    """Like disassemble(), but also shows up to `max_before` instructions before `addr`."""
+    data = b""
+    lo = addr
+    for back in (before, before // 2, 0x20, 0):
+        lo = addr - back
+        try:
+            data = client.read(pid, lo, back + after)
+            break
+        except Exception:
+            try:
+                data = client.read(pid, lo, back + 0x100)
+                break
+            except Exception:
+                data = b""
+    if not data or _cs is None:
+        return disassemble(client, pid, addr, after, max_after, overrides)
+    if overrides:
+        buf = bytearray(data)
+        for a, b in overrides.items():
+            if lo <= a < lo + len(buf):
+                buf[a - lo] = b
+        data = bytes(buf)
+    start = context_start(data, lo, addr, max_before) if addr > lo else addr
+    insns = decode(data[start - lo:], start, max_before + max_after + 8)
+    if not any(i.addr == addr for i in insns):              # never lose the line we were asked for
+        insns = decode(data[addr - lo:], addr, max_after)
+    return insns, True

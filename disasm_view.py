@@ -132,9 +132,25 @@ class DisasmView(ttk.Frame):
         if iid in self._by_iid:
             self.tree.selection_set(iid)
             self.tree.focus(iid)
-            self.tree.see(iid)
+            self._show_with_context(iid)
             return True
         return False
+
+    def _show_with_context(self, iid: str) -> None:
+        """Scroll so the row sits about a third of the way down: the code leading up to it stays visible."""
+        rows = self.tree.get_children()
+        try:
+            idx = rows.index(iid)
+        except ValueError:
+            return
+        self.tree.update_idletasks()
+        first = self.tree.bbox(rows[0]) if rows else None
+        row_h = (first[3] if first else 0) or 17
+        visible = max(1, (self.tree.winfo_height() - row_h) // row_h)
+        top = max(0, idx - visible // 3)
+        if len(rows) > visible:
+            self.tree.yview_moveto(top / len(rows))
+        self.tree.see(iid)
 
     def has(self, addr: int) -> bool:
         return self._iid(addr) in self._by_iid

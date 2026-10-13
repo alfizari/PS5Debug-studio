@@ -394,6 +394,8 @@ class SaveCheatDialog:
         fit_geometry(win, 520, 330)
         bt = ttk.Frame(win, padding=(10, 0, 10, 10))
         bt.pack(side="bottom", fill="x")             # first, so Save is never cut off
+        ttk.Button(bt, text="Save cheat", style="Accent.TButton", command=self.on_save).pack(side="left")
+        ttk.Button(bt, text="Cancel", command=win.destroy).pack(side="left", padx=6)
         f = ttk.Frame(win, padding=10)
         f.pack(fill="both", expand=True)
         self.name = tk.StringVar(value=f"Code cave {cave.sym}")
@@ -425,14 +427,12 @@ class SaveCheatDialog:
         ttk.Entry(f, textvariable=self.gname, width=44).grid(row=4, column=1, sticky="we")
         ttk.Label(f, text="Title ID").grid(row=5, column=0, sticky="w", pady=2)
         ttk.Entry(f, textvariable=self.tid, width=20).grid(row=5, column=1, sticky="w")
-        vars_ = codecave.dollar_vars(step["asm"])
+        vars_ = codecave.dollar_vars(str(self.step.get("asm", "")))   # `step` may be [aob, hook]
         if vars_:
             ttk.Label(f, foreground=theme.c("muted"), wraplength=480,
                       text="$" + ", $".join(vars_) + " in the code become inputs on the Cheats tab (u64, default 0).").grid(
                 row=6, column=0, columnspan=2, sticky="w", pady=6)
         f.columnconfigure(1, weight=1)
-        ttk.Button(bt, text="Save cheat", style="Accent.TButton", command=self.on_save).pack(side="left")
-        ttk.Button(bt, text="Cancel", command=win.destroy).pack(side="left", padx=6)
 
     def on_save(self) -> None:
         name = self.name.get().strip()

@@ -8,6 +8,7 @@ import re
 import struct
 import sys
 import threading
+import time
 import tkinter as tk
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -940,11 +941,21 @@ class FunctionCallerApp:
         ttk.Button(b, text="Cancel", command=win.destroy).pack(side="right", padx=6)
 
     def on_close(self) -> None:
+        dbg = getattr(self, "debugger", None)
+        if dbg is not None and dbg.attached and self.client.connected:
+            # detach cleanly so the console is not left tearing the session down on its own
+            t = threading.Thread(target=lambda: self._end_debug_session("closing the tool"), daemon=True)
+            t.start()
+            t.join(3.0)
         try:
             self.settings["ip"] = self.ip_var.get().strip()
             self.settings["port"] = int(self.port_var.get().strip() or SERVER_PORT)
             if self.root.state() == "normal":
                 self.settings["geometry"] = self.root.geometry()
+            try:
+                self.debugger.remember_layout()
+            except Exception:
+                pass
             save_settings(self.settings)
         except Exception:
             pass
@@ -1176,6 +1187,12 @@ class FunctionCallerApp:
 
     def _on_lost(self, why: str) -> None:
         self.log_line(f"connection lost: {why}")
+        dbg = getattr(self, "debugger", None)
+        if dbg is not None and dbg.attached:            # the console ends the session on its own now
+            dbg._reset_state()
+            dbg._after_detach()
+            self._debug_dropped_at = time.monotonic()
+            self.log_line("debugger: the session ended with the connection - attach again after reconnecting")
         self._set_status("Connection lost - press Connect")
         try:
             self.scanner.disconnect()
@@ -1252,9 +1269,47 @@ class FunctionCallerApp:
         except Exception:
             pass
 
+    # Reconnecting while the debugger is attached made the console tear the old debug session
+    # down on its own while the new connection was already sending commands (attach, process
+    # list ...) - that race could panic the kernel.  So: end the debug session cleanly over the
+    # old connection first, and give the payload a moment before the new connection talks.
+    _TEARDOWN_WAIT = 2.0
+
+    def _end_debug_session(self, why: str) -> bool:
+        """Worker thread: detach the debugger over the current connection (if it is attached).
+        Returns True if there was a session."""
+        dbg = getattr(self, "debugger", None)
+        if dbg is None or not dbg.attached:
+            return False
+        if self.client.connected:
+            try:
+                self.client.debug_detach()
+            except Exception as exc:
+                self.root.after(0, lambda e=exc: self.log_line(f"debugger: detach failed ({e})"))
+        dbg._reset_state()
+        self._debug_dropped_at = time.monotonic()
+        self.root.after(0, lambda: (self.log_line(f"debugger detached ({why})"), dbg._after_detach()))
+        return True
+
+    def _wait_teardown(self) -> None:
+        """Worker thread: if a debug session just ended, let the payload finish cleaning it up."""
+        left = getattr(self, "_debug_dropped_at", 0.0) + self._TEARDOWN_WAIT - time.monotonic()
+        if left > 0:
+            self.root.after(0, lambda: self.log_line(
+                f"waiting {left:.1f}s for the console to finish closing the debug session..."))
+            time.sleep(left)
+
     def on_connect(self) -> None:
         host = self.ip_var.get().strip()
         port = int(self.port_var.get().strip() or SERVER_PORT)
+        dbg = getattr(self, "debugger", None)
+        if self.client.connected and dbg is not None and dbg.attached:
+            if not messagebox.askyesno(
+                    "Reconnect",
+                    f"The debugger is attached to pid {dbg.pid}.\n\nReconnecting ends that debug session. "
+                    "Detach cleanly now and reconnect?\n\n(Breakpoints stay in your list and are set "
+                    "again when you attach.)"):
+                return
 
         self.settings["ip"], self.settings["port"] = host, port
         save_settings(self.settings)
@@ -1264,6 +1319,10 @@ class FunctionCallerApp:
             pass
 
         def work() -> None:
+            self._end_debug_session("reconnecting")
+            if self.client.connected:
+                self.client.close()
+            self._wait_teardown()
             self.client.connect(host, port)
             ver = self.client.version()
             brand = self.client.branding().split("\x00", 1)[0]
@@ -1282,6 +1341,13 @@ class FunctionCallerApp:
         self._run_bg(work, "Connecting...")
 
     def on_disconnect(self) -> None:
+        dbg = getattr(self, "debugger", None)
+        if dbg is not None and dbg.attached and self.client.connected:
+            def work() -> None:
+                self._end_debug_session("disconnecting")
+                self.root.after(0, self.on_disconnect)
+            self._run_bg(work, "Detaching debugger...")
+            return
         self.client.close()
         try:
             self.klog.stop()
