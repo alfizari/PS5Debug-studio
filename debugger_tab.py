@@ -29,6 +29,7 @@ from debugger_core import (
 )
 from disasm import K_CALL, Insn
 from disasm_view import DisasmView
+from scrollable import ScrollFrame
 from ps5debug_client import ProtocolError
 import theme  # noqa: E402
 
@@ -102,6 +103,10 @@ class DebuggerTab:
 
     # ================================================================ UI
     def _build(self, parent: ttk.Frame) -> None:
+        # on small screens the tab keeps a usable size and scrolls instead of cutting panels off
+        scroll = ScrollFrame(parent, min_height=640, min_width=1000)
+        scroll.pack(fill="both", expand=True)
+        parent = scroll.body
         style = ttk.Style(parent)
         style.configure("Dbg.Treeview", font=("Consolas", 9), rowheight=17)
 
@@ -152,14 +157,8 @@ class DebuggerTab:
         ttk.Button(gb, text="Go", width=5, command=self.on_view_go).pack(side="left", padx=2)
         ttk.Button(gb, text="Go to RIP", command=self.on_view_rip).pack(side="left", padx=2)
 
-        self.view = DisasmView(
-            left, on_follow=self._follow, menu_items=self._menu, on_toggle_bp=lambda i: self.toggle_bp(i.addr),
-            height=16,
-        )
-        self.view.pack(fill="both", expand=True)
-
         bpf = ttk.LabelFrame(left, text="Breakpoints / watchpoints", padding=4)
-        bpf.pack(fill="x", pady=(4, 0))
+        bpf.pack(side="bottom", fill="x", pady=(4, 0))
         self.bp_tree = ttk.Treeview(
             bpf, columns=("slot", "type", "addr", "where", "on", "hits"), show="headings", height=5,
             style="Dbg.Treeview", selectmode="browse",
@@ -181,6 +180,13 @@ class DebuggerTab:
         ttk.Button(bb, text="Enable / disable", command=self.on_bp_toggle_enabled).pack(side="left", padx=2)
         ttk.Button(bb, text="Remove", command=self.on_bp_remove).pack(side="left", padx=2)
         ttk.Button(bb, text="Remove all", command=self.on_bp_remove_all).pack(side="left", padx=2)
+
+        self.view = DisasmView(
+            left, on_follow=self._follow, menu_items=self._menu, on_toggle_bp=lambda i: self.toggle_bp(i.addr),
+            height=16,
+        )
+        self.view.pack(fill="both", expand=True)
+
 
         # ---- right: registers + notebook
         regf = ttk.LabelFrame(right, text="Registers  (double-click: edit   right-click: copy / view in hex editor)",

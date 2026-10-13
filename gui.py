@@ -36,7 +36,7 @@ from ps5debug_client import (  # noqa: E402
     SERVER_PORT,
 )
 from scanner_tab import ScannerTab  # noqa: E402
-from scrollable import ScrollFrame  # noqa: E402
+from scrollable import ScrollFrame, fit_geometry  # noqa: E402
 import theme  # noqa: E402
 
 SETTINGS_FILE = APP_DIR / "settings.json"
@@ -595,7 +595,7 @@ class FunctionCallerApp:
         win = tk.Toplevel(self.root)
         self.quick_win = win
         win.title("Assembler - write x86-64, put it in memory, call it")
-        win.geometry("960x620")
+        fit_geometry(win, 960, 620)
         win.minsize(680, 420)
         win.protocol("WM_DELETE_WINDOW", win.withdraw)
         box = ttk.Frame(win, padding=10)
@@ -1054,7 +1054,7 @@ class FunctionCallerApp:
         win = tk.Toplevel(self.root)
         self._log_win = win
         win.title("Log (live)")
-        win.geometry("900x480")
+        fit_geometry(win, 900, 480)
 
         bar = ttk.Frame(win, padding=6)
         bar.pack(fill="x")

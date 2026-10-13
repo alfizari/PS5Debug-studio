@@ -14,6 +14,8 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
+from scrollable import fit_geometry
+
 import cheat_export as ce
 import cheat_pack
 
@@ -34,7 +36,7 @@ class ExportDialog:
         self.win = w = tk.Toplevel(app.root)
         w.title(f"Export cheats - {game.name}")
         w.transient(app.root)
-        w.geometry("980x600")
+        fit_geometry(w, 980, 600)
         w.minsize(760, 420)
         top = ttk.Frame(w, padding=10)
         top.pack(fill="both", expand=True)

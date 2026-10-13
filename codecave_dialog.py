@@ -18,6 +18,7 @@ from typing import Optional
 import codecave
 import disasm
 from cheats import Cheat, Game, Runtime
+from scrollable import fit_geometry
 import theme  # noqa: E402
 
 
@@ -62,7 +63,7 @@ class CodeCaveDialog:
         win = tk.Toplevel(self.app.root)
         self.win = win
         win.title(f"Code cave  -  {self.sym}")
-        win.geometry("900x700")
+        fit_geometry(win, 900, 700)
         win.transient(self.app.root)
 
         self.info_var = tk.StringVar()
@@ -113,8 +114,10 @@ class CodeCaveDialog:
         oys.pack(side="right", fill="y")
         self.out.tag_configure("err", foreground=theme.c("danger"))
 
+        # button rows are packed at the bottom ahead of the editors, so on a small screen the
+        # editors shrink and the buttons stay visible
         b1 = ttk.Frame(win, padding=(8, 4))
-        b1.pack(fill="x")
+        b1.pack(side="bottom", fill="x", before=mid)
         ttk.Button(b1, text="Assemble preview", command=self.on_preview).pack(side="left", padx=2)
         self.btn_enable = ttk.Button(b1, text="Enable hook", command=self.on_enable)
         self.btn_enable.pack(side="left", padx=2)
@@ -122,7 +125,7 @@ class CodeCaveDialog:
         self.btn_disable.pack(side="left", padx=2)
         ttk.Button(b1, text="Reset to original instructions", command=self.on_reset).pack(side="left", padx=10)
         b2 = ttk.Frame(win, padding=(8, 0, 8, 8))
-        b2.pack(fill="x")
+        b2.pack(side="bottom", fill="x", before=b1)
         ttk.Button(b2, text="Insert step into Cheat Editor", command=self.on_insert_step).pack(side="left", padx=2)
         ttk.Button(b2, text="Save as new cheat...", command=self.on_save_cheat).pack(side="left", padx=2)
         ttk.Button(b2, text="Close", command=win.destroy).pack(side="right", padx=2)
@@ -388,7 +391,9 @@ class SaveCheatDialog:
         self.win = win
         win.title("Save code cave as cheat")
         win.transient(cave.win)
-        win.geometry("520x330")
+        fit_geometry(win, 520, 330)
+        bt = ttk.Frame(win, padding=(10, 0, 10, 10))
+        bt.pack(side="bottom", fill="x")             # first, so Save is never cut off
         f = ttk.Frame(win, padding=10)
         f.pack(fill="both", expand=True)
         self.name = tk.StringVar(value=f"Code cave {cave.sym}")
@@ -426,9 +431,7 @@ class SaveCheatDialog:
                       text="$" + ", $".join(vars_) + " in the code become inputs on the Cheats tab (u64, default 0).").grid(
                 row=6, column=0, columnspan=2, sticky="w", pady=6)
         f.columnconfigure(1, weight=1)
-        bt = ttk.Frame(win, padding=(10, 0, 10, 10))
-        bt.pack(fill="x")
-        ttk.Button(bt, text="Save cheat", command=self.on_save).pack(side="left")
+        ttk.Button(bt, text="Save cheat", style="Accent.TButton", command=self.on_save).pack(side="left")
         ttk.Button(bt, text="Cancel", command=win.destroy).pack(side="left", padx=6)
 
     def on_save(self) -> None:

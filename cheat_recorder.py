@@ -11,6 +11,7 @@ from tkinter import messagebox, ttk
 from typing import Any, Optional
 
 from cheats import Cheat, Game, ensure_string_params
+from scrollable import ScrollFrame, fit_geometry
 import theme  # noqa: E402
 
 MAX_BUF_SNAPSHOT = 0x10000
@@ -342,7 +343,7 @@ class RecordDialog:
 
         self.win = tk.Toplevel(app.root)
         self.win.title("Record cheat from Caller")
-        self.win.geometry("1320x780")
+        fit_geometry(self.win, 1320, 780)
         self.win.transient(app.root)
 
         v = tk.StringVar
@@ -362,8 +363,16 @@ class RecordDialog:
         if snap.patches and not snap.rip:
             self.mode.set("toggle")
 
-        left = ttk.Frame(self.win, padding=8)
-        left.pack(side="left", fill="y")
+        bottom = ttk.Frame(self.win, padding=(8, 4, 8, 8))
+        bottom.pack(side="bottom", fill="x")             # first: always visible, whatever the screen size
+        ttk.Button(bottom, text="Save cheat", style="Accent.TButton", command=self.on_save).pack(side="left")
+        ttk.Button(bottom, text="Cancel", command=self.win.destroy).pack(side="left", padx=6)
+        ttk.Separator(self.win).pack(side="bottom", fill="x")
+        lscroll = ScrollFrame(self.win, horizontal=False)  # the options column scrolls on short screens
+        lscroll.pack(side="left", fill="y")
+        lscroll.canvas.configure(width=330)
+        left = ttk.Frame(lscroll.body, padding=8)
+        left.pack(fill="both", expand=True)
         mid = ttk.Frame(self.win, padding=8)
         mid.pack(side="left", fill="y")
         right = ttk.Frame(self.win, padding=8)
@@ -411,9 +420,9 @@ class RecordDialog:
                        "the hex view.").pack(anchor="w")
         check("  ...safety check: stop if the original bytes differ", self.chk_orig)
         check("Free buffers after the call", self.free_after)
-        ttk.Button(left, text="Save cheat", command=self.on_save).pack(anchor="w", pady=12)
         for w in snap.warnings:
             ttk.Label(left, text="! " + w, foreground=theme.c("warn"), wraplength=300).pack(anchor="w")
+        self.win.after_idle(lambda: lscroll.canvas.configure(width=left.winfo_reqwidth()))
 
         # ---- middle: editable values
         ttk.Label(mid, text="Editable values", font=("Segoe UI", 10, "bold")).pack(anchor="w")

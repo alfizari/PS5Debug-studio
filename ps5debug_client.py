@@ -960,7 +960,8 @@ class PS5DebugClient:
                       ) -> tuple[bytes, int, int, int]:
         """One console pass (modified payload, CAPS bit TSE_POINTER_SCAN): every 8-byte slot in `segments`
         whose value v has  f - max_off <= v <= f  for an address f of `frontier` (sorted little-endian u64s).
-        -> (records blob of {u64 slot, u64 value}, total hits, bytes scanned, status 0 ok/1 cancelled/2 capped)."""
+        -> (records blob of {u64 slot, u64 value}, total hits, bytes scanned, status 0 ok/1 cancelled/2 capped).
+        Bytes the console could not read in this pass are left in self.last_ptrscan_unreadable."""
         self.ensure_auth()
         nfront = len(frontier) // 8
         hdr = struct.pack("<IIQII", pid, 1 if alias else 0, max_off, len(segments), nfront)
@@ -986,8 +987,17 @@ class PS5DebugClient:
                     raise self._broken("pointer scan: bad block size")
                 parts.append(self._recv(n * 16))
             total_hits, scanned = struct.unpack("<QQ", self._recv(16))
-            status = self._recv_u32()
-            self._expect_success("pointer scan (end)")
+            # newer payloads add u64 bytes_unreadable before the status; older ones send
+            # u32 status + the SUCCESS word right away.  bytes_unreadable is < 2^47, so a high
+            # half equal to the SUCCESS word can only be the older layout.
+            lo, hi = struct.unpack("<II", self._recv(8))
+            if hi == STATUS_SUCCESS and lo <= 2:
+                status, unreadable = lo, 0
+            else:
+                unreadable = lo | (hi << 32)
+                status = self._recv_u32()
+                self._expect_success("pointer scan (end)")
+        self.last_ptrscan_unreadable = unreadable
         return b"".join(parts), total_hits, scanned, status
 
     def turbo_caps(self, timeout: float = 4.0) -> Optional[TurboCaps]:

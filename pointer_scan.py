@@ -649,6 +649,10 @@ def search_live(cli, pid: int, target: int, max_level: int = 5, max_off: int = 0
                     raise Cancelled()
                 if status == 2:
                     note = f"level {k}: the console stopped at its hit limit - lower the max offset"
+                lost = getattr(cli, "last_ptrscan_unreadable", 0) if on_console else 0
+                if lost:
+                    say(f"level {k}: {lost / 1048576:,.1f} MB could not be read on the console "
+                        "(memory freed during the pass) - chains through it may be missing")
                 if blob is not None:
                     arr = np.frombuffer(blob, dtype="<u8").reshape(-1, 2)
                     p_addr, p_val = arr[:, 0].astype(u64), arr[:, 1].astype(u64)

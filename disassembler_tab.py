@@ -15,6 +15,7 @@ from codecave_dialog import CodeCaveDialog, HookState
 from debugger_core import label_for
 from disasm_view import DisasmView
 from disasm import Insn
+from scrollable import fit_geometry
 import theme  # noqa: E402
 
 
@@ -469,7 +470,7 @@ class DisassemblerTab:
     def _show_xrefs(self, target: int, hits: list[int], maps) -> None:
         win = tk.Toplevel(self.app.root)
         win.title(f"References to 0x{target:X}")
-        win.geometry("560x380")
+        fit_geometry(win, 560, 380)
         ttk.Label(
             win, padding=8, wraplength=520,
             text=f"{len(hits)} instruction(s) with a RIP-relative operand pointing at 0x{target:X} "

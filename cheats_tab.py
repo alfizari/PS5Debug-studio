@@ -14,6 +14,7 @@ import asmgen
 from cheat_recorder import ArgSnap, RecordDialog, collect
 from cheats import Cheat, CheatError, Game, execute, load_games, parse_param
 from items import SearchCombobox
+from scrollable import fit_geometry
 import theme  # noqa: E402
 
 HELP = """\
@@ -528,7 +529,7 @@ class CheatsTab:
     def on_help(self) -> None:
         win = tk.Toplevel(self.app.root)
         win.title("Cheat format")
-        win.geometry("780x640")
+        fit_geometry(win, 780, 640)
         t = tk.Text(win, wrap="none", font=("Consolas", 10))
         t.insert("1.0", HELP)
         t.configure(state="disabled")
@@ -551,7 +552,7 @@ class CodeStepDialog:
         win = tk.Toplevel(tab.app.root)
         self.win = win
         win.title("Insert code step")
-        win.geometry("760x560")
+        fit_geometry(win, 760, 560)
         win.transient(tab.app.root)
 
         top = ttk.Frame(win, padding=8)

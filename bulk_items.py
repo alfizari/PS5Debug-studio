@@ -11,6 +11,8 @@ import threading
 import tkinter as tk
 from tkinter import messagebox, ttk
 
+from scrollable import fit_geometry
+
 
 class BulkItemsDialog:
     def __init__(self, app, store, game, cheat, param: dict) -> None:
@@ -26,7 +28,7 @@ class BulkItemsDialog:
         win = tk.Toplevel(app.root)
         self.win = win
         win.title(f"Add all items - {cheat.name}")
-        win.geometry("600x400")
+        fit_geometry(win, 600, 400)
         win.transient(app.root)
         win.protocol("WM_DELETE_WINDOW", self.on_close)
 
