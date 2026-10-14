@@ -27,7 +27,7 @@ from aes_cbc import cbc_decrypt
 
 MC4_KEY = b"304c6528f659c766110239a51cl5dd9c"
 MC4_IV = b"u@}kzW2u[u(8DWar"
-TITLE_RE = re.compile(r"\b(PPSA\d{5}|CUSA\d{5}|PPSA\d{5})")
+TITLE_RE = re.compile(r"(?<![A-Za-z0-9])(PPSA\d{5}|CUSA\d{5})(?!\d)")   # "_" may touch it
 
 EXTENSIONS = ("*.json", "*.shn", "*.mc4", "*.ps5c", "*.ProjReap", "*.ReapPatch")
 
@@ -38,8 +38,8 @@ class FormatError(Exception):
 
 def _hex(text: str) -> str:
     h = re.sub(r"[^0-9A-Fa-f]", "", str(text).replace("0x", "").replace("0X", ""))
-    if len(h) % 2:
-        raise FormatError(f"odd number of hex digits in '{text}'")
+    if len(h) % 2:                     # like GoldHEN / onionHEN: "ABC" = 0A BC
+        h = "0" + h
     return " ".join(h[i:i + 2] for i in range(0, len(h), 2)).upper()
 
 
@@ -54,6 +54,18 @@ def _base(section) -> str:
     except ValueError:
         n = 0
     return "module(main)" if n == 0 else f"module(main#{n})"
+
+
+def _is_true(v) -> bool:
+    """<Absolute>true</Absolute> / "absolute": true"""
+    return str(v).strip().lower() in ("1", "true", "yes", "y")
+
+
+def _addr_expr(section, offset, absolute=False) -> str:
+    """Absolute lines hold the real address; the rest are relative to the executable."""
+    if absolute:
+        return f"0x{_off(offset):X}"
+    return f"{_base(section)}+0x{_off(offset):X}"
 
 
 def _title(*texts: str) -> str:
@@ -87,7 +99,7 @@ def from_goldhen_json(d: dict) -> dict:
     for m in d.get("mods", []):
         lines = []
         for mem in m.get("memory", []):
-            addr = f"{_base(mem.get('section'))}+0x{_off(mem['offset']):X}"
+            addr = _addr_expr(mem.get("section"), mem["offset"], _is_true(mem.get("absolute", False)))
             lines.append((addr, _hex(mem.get("on", "")), _hex(mem.get("off", "")) if mem.get("off") else ""))
         mode = "once" if str(m.get("type", "checkbox")).lower() == "button" else "toggle"
         cheats.append(_onoff_cheat(str(m.get("name", "cheat")), lines, mode))
@@ -131,7 +143,7 @@ def from_shn(text: str, source: str = "shn") -> dict:
         lines = []
         for cl in ch.findall("Cheatline"):
             off = (cl.findtext("Offset") or "0").strip()
-            addr = f"{_base(cl.findtext('Section'))}+0x{_off(off):X}"
+            addr = _addr_expr(cl.findtext("Section"), off, _is_true(cl.findtext("Absolute") or ""))
             lines.append((addr, _hex(cl.findtext("ValueOn") or ""), _hex(cl.findtext("ValueOff") or "")))
         if lines:
             cheats.append(_onoff_cheat(ch.get("Text") or "cheat", lines))
@@ -150,12 +162,17 @@ def _reap_cheat(p: dict, notes: list[str]) -> dict:
     vars_ = {v["label"]: v for v in p.get("Variables", []) if v.get("label")}
     finders = {k: v for k, v in vars_.items() if v.get("type") == 11 and v.get("offsetFinder")}
     addrs = {k: v for k, v in vars_.items() if v.get("type") == 6}
+    # code at a fixed offset from the executable (no AOB): baseId "0" + offset, e.g.
+    # {"label":"healthSource","baseId":"0","offset":31563972,"newValue":"nop:6","defaultValue":"mov ..."}
+    statics = {k: v for k, v in vars_.items() if v.get("type") == 11 and not v.get("offsetFinder")
+               and str(v.get("baseId") or "0") == "0" and int(v.get("offset") or 0) > 0
+               and str(v.get("newValue") or "").strip()}
     codes = {k: v for k, v in vars_.items() if v.get("type") == 11 and not v.get("offsetFinder")
-             and not v.get("baseId")}
+             and not v.get("baseId") and k not in statics}
     sites = {k: v for k, v in vars_.items() if v.get("type") == 11 and not v.get("offsetFinder")
              and v.get("baseId") and v.get("baseId") != "0"}
     data = {k: v for k, v in vars_.items() if k not in finders and k not in addrs and k not in codes
-            and k not in sites}
+            and k not in sites and k not in statics}
     name = str(p.get("name") or "patch")
     steps: list[dict] = []
     params: list[dict] = []
@@ -222,9 +239,23 @@ def _reap_cheat(p: dict, notes: list[str]) -> dict:
     # 4. each AOB site whose new code is "jmp <cave>" (+nops) becomes a hook
     hooked: set[str] = set()
     patch_steps: list[dict] = []
-    for lbl, v in list(finders.items()) + list(sites.items()):
+    for lbl, v in list(finders.items()) + list(sites.items()) + list(statics.items()):
         new = str(v.get("newValue") or "").replace("\r", "").strip()
         if not new:
+            continue
+        if lbl in statics:
+            site = f"module(main)+0x{int(v['offset']):X}"
+        elif lbl in finders:
+            site = f"${lbl}"
+        else:
+            site = f"${v['baseId']}+0x{int(v.get('offset') or 0):X}"
+        nop = re.fullmatch(r"nop\s*:\s*(\d+)", new, flags=re.IGNORECASE)
+        if nop:                         # ShnExt shorthand: N bytes of 0x90 (original restored on off)
+            n = int(nop.group(1))
+            if not 0 < n <= 4096:
+                notes.append(f"{name}: '{lbl}' has a bad nop count ({new})")
+                continue
+            patch_steps.append({"op": "patch", "addr": site, "type": "hex", "value": " ".join(["90"] * n)})
             continue
         m = re.fullmatch(rf"jmp\s+({_IDENT})((?:\s*\n\s*nop)*)\s*", new, flags=re.IGNORECASE)
         try:
@@ -253,7 +284,7 @@ def _reap_cheat(p: dict, notes: list[str]) -> dict:
                         and int(rv.get("offset") or 0) == new_len), None)
             if ret:
                 cave = re.sub(rf"\n?\s*jmp\s+\${ret}\s*$", "", cave, flags=re.IGNORECASE)
-            st = {"op": "hook", "name": target, "addr": f"${lbl}", "asm": cave}
+            st = {"op": "hook", "name": target, "addr": site, "asm": cave}
             if orig_hex:
                 st["orig"] = orig_hex
             else:
@@ -261,8 +292,7 @@ def _reap_cheat(p: dict, notes: list[str]) -> dict:
             patch_steps.append(st)
             hooked.add(target)
         else:
-            addr = f"${lbl}" if lbl in finders else f"${v['baseId']}+0x{int(v.get('offset') or 0):X}"
-            patch_steps.append({"op": "asmpatch", "addr": addr, "asm": translate(new)})
+            patch_steps.append({"op": "asmpatch", "addr": site, "asm": translate(new)})
     # 5. code blocks not reached through a hook: plain code buffers near the game code
     for lbl, v in codes.items():
         if lbl in hooked:
@@ -328,7 +358,12 @@ def from_shnext_data(meta: dict, loaded: list[dict], src_name: str) -> tuple[dic
     tid = _title(src_name, str(meta.get("Game", "")), str(meta.get("Cusa", "")))
     gname = src_name.split(tid)[0].strip("-_ ").replace("-", " ") if tid and tid in src_name else ""
     authors = sorted({c.get("author", "") for c in cheats if c.get("author")})
-    game = {"format": "ps5cheat/1", "game": gname or tid or str(meta.get("Game") or "game"), "title_id": tid,
+    # "Game" is the real title in some projects ("Assassin's Creed Mirage") and an id in others
+    # ("PSA25286_00-0206770389642527") - use it only when it reads like a name
+    stored = str(meta.get("Game") or "").strip()
+    if not re.search(r"[A-Za-z]{2}", stored) or re.match(r"[A-Z]{3,4}\d{3,}", stored) or " " not in stored and "_" in stored:
+        stored = ""
+    game = {"format": "ps5cheat/1", "game": stored or gname or tid or "game", "title_id": tid,
             "version": str(meta.get("Version", "")), "process": str(meta.get("ProcessName") or "eboot.bin"),
             "author": ", ".join(authors), "notes": str(meta.get("Comment", "")).replace("\r", ""),
             "cheats": cheats}
