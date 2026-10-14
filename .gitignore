@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+# private: never commit
+shnext_decryptor.py
