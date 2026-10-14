@@ -76,33 +76,88 @@ def _title(*texts: str) -> str:
     return ""
 
 
-def _onoff_cheat(name: str, lines: list[tuple[str, str, str]], mode: str = "toggle", desc: str = "") -> dict:
-    """lines: (address expression, on hex, off hex)"""
+def _digits(text) -> int:
+    return len(re.sub(r"[^0-9A-Fa-f]", "", str(text).replace("0x", "").replace("0X", "")))
+
+
+def _line(section, offset, on: str, off: str, absolute=False) -> dict:
+    """on / off: raw text from the file.  An off value with an odd number of hex digits is
+    damaged (a digit is missing somewhere): it is not trusted - the bytes the game had before
+    the cheat are restored instead."""
+    on_hex = _hex(on)
+    off_hex = "" if _digits(off) % 2 else (_hex(off) if str(off or "").strip() else "")
+    try:
+        sec = int(str(section or "0").strip() or "0", 0)
+    except ValueError:
+        sec = 0
+    if not 0 <= sec < 64:                   # out of range: 0, like onionHEN
+        sec = 0
+    return {"sec": 0 if absolute else sec, "off": _off(offset), "abs": bool(absolute),
+            "addr": _addr_expr(sec, offset, absolute), "on": on_hex, "offv": off_hex}
+
+
+def _onoff_cheat(name: str, lines: list[dict], mode: str = "toggle", desc: str = "", mc=None) -> dict:
+    """lines from _line().  Section N lines also carry the executable-base address ("alt") and
+    their bytes ("verify"), so the runtime can use whichever is right (see cheats.Runtime._site);
+    mc = the Master Code's first line, for a Master Code dependent."""
     steps, off = [], []
-    for addr, on, offv in lines:
-        if offv.strip():
-            steps.append({"op": "write", "addr": addr, "type": "hex", "value": on})
-            off.append({"op": "write", "addr": addr, "type": "hex", "value": offv})
+    for ln in lines:
+        extra: dict = {}
+        if mc is not None:
+            extra = {"mc": {"addr": mc["addr"], "size": len(bytes.fromhex(mc["on"].replace(" ", ""))),
+                            "offset": ln["off"]},
+                     "verify": {"off": ln["offv"], "on": ln["on"]}}
+        elif ln["sec"] and not ln["abs"]:
+            extra = {"alt": f"module(main)+0x{ln['off']:X}", "verify": {"off": ln["offv"], "on": ln["on"]}}
+        if mode == "once":                   # GoldHEN button: no undo, but keep its off bytes for re-export
+            st = {"op": "write", "addr": ln["addr"], "type": "hex", "value": ln["on"], **extra}
+            if ln["offv"].strip():
+                st["button_off"] = ln["offv"]
+            steps.append(st)
+        elif ln["offv"].strip():
+            steps.append({"op": "write", "addr": ln["addr"], "type": "hex", "value": ln["on"], **extra})
+            off.append({"op": "write", "addr": ln["addr"], "type": "hex", "value": ln["offv"], **extra})
         else:
-            steps.append({"op": "patch", "addr": addr, "type": "hex", "value": on})
+            steps.append({"op": "patch", "addr": ln["addr"], "type": "hex", "value": ln["on"], **extra})
     c = {"name": name, "mode": mode, "steps": steps}
     if desc:
         c["description"] = desc
+    if mc is not None:
+        c["description"] = ((desc + "\n") if desc else "") + "Needs the Master Code: turn that on first."
     if off and mode == "toggle":
         c["off"] = off
     return c
 
 
+_MASTER_RE = re.compile(r"master\s*code", re.IGNORECASE)
+
+
+def _cheats_with_master(raw: list[tuple[str, list[dict], str]]) -> list[dict]:
+    """raw: (name, lines, mode).  GoldHEN / onionHEN Master Code rule: the first cheat named
+    "Master Code" is the master; a cheat with "MC" in its name, one line, Section != 0 is a
+    dependent whose real address is inside the code the master wrote."""
+    master = next((lines[0] for name, lines, _m in raw if _MASTER_RE.search(name) and lines), None)
+    out = []
+    for name, lines, mode in raw:
+        dep = (master is not None and "MC" in name and not _MASTER_RE.search(name)
+               and len(lines) == 1 and lines[0]["sec"] != 0 and not lines[0]["abs"])
+        out.append(_onoff_cheat(name, lines, mode, mc=master if dep else None))
+    return out
+
+
 # ------------------------------------------------------------------ GoldHEN json
 def from_goldhen_json(d: dict) -> dict:
-    cheats = []
+    raw = []
     for m in d.get("mods", []):
-        lines = []
-        for mem in m.get("memory", []):
-            addr = _addr_expr(mem.get("section"), mem["offset"], _is_true(mem.get("absolute", False)))
-            lines.append((addr, _hex(mem.get("on", "")), _hex(mem.get("off", "")) if mem.get("off") else ""))
+        lines = [_line(mem.get("section"), mem["offset"], mem.get("on", ""), mem.get("off") or "",
+                       _is_true(mem.get("absolute", False)))
+                 for mem in m.get("memory", [])
+                 if str(mem.get("offset", "")).strip() and str(mem.get("on", "")).strip()]
+        if not lines:                       # "TRAINER INFO (read only)" entries: text only, nothing to patch
+            continue
         mode = "once" if str(m.get("type", "checkbox")).lower() == "button" else "toggle"
-        cheats.append(_onoff_cheat(str(m.get("name", "cheat")), lines, mode))
+        raw.append((str(m.get("name", "cheat")), lines, mode))
+    cheats = _cheats_with_master(raw)
     credits = d.get("credits") or []
     return {"format": "ps5cheat/1", "game": str(d.get("name") or d.get("id") or "game"),
             "title_id": str(d.get("id", "")).upper(), "version": str(d.get("version", "")),
@@ -120,13 +175,34 @@ def decrypt_mc4(data: bytes) -> str:
     pad = pt[-1] if pt else 0
     if 1 <= pad <= 16 and pt.endswith(bytes([pad]) * pad):
         pt = pt[:-pad]
-    text = pt.decode("utf-8", "ignore")
-    text = (text.replace("&lt;", "<").replace("&gt;", ">").replace("\\&quot;", '"').replace("\\&apos;", "'")
+    text = _decode_text(pt)
+    if "<Trainer" not in text:           # some tools store the XML escaped a second time
+        text = (text.replace("&lt;", "<").replace("&gt;", ">").replace("\\&quot;", '"').replace("\\&apos;", "'")
             .replace("&quot;", '"').replace("&apos;", "'"))
     m = re.search(r"<\?xml.*</Trainer>", text, flags=re.DOTALL) or re.search(r"<Trainer.*</Trainer>", text, re.DOTALL)
     if not m:
         raise FormatError("mc4 did not decrypt to a trainer (wrong file?)")
     return m.group(0)
+
+
+def _decode_text(b: bytes) -> str:
+    """UTF-8, or UTF-16 with a BOM (some .shn files are saved that way)."""
+    if b[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return b.decode("utf-16", "replace")
+    if len(b) > 3 and b[1:2] == b"\0" and b[3:4] == b"\0":
+        return b.decode("utf-16-le", "replace")
+    return b.decode("utf-8-sig", "replace")
+
+
+_ATTR_RE = re.compile(r'(\s[\w:]+=")(.*?)("(?=\s+[\w:]+="|\s*/?>))', re.DOTALL)
+
+
+def _repair_attrs(xml: str) -> str:
+    """Escape stray quotes / & / < inside attribute values: Text="Max YEN "After Used" " """
+    def tag(m: re.Match) -> str:
+        return _ATTR_RE.sub(lambda a: a.group(1) + a.group(2).replace("&", "&amp;").replace("&amp;amp;", "&amp;")
+                            .replace('"', "&quot;").replace("<", "&lt;") + a.group(3), m.group(0))
+    return re.sub(r"<[A-Za-z][^<>]*?/?>", tag, xml)
 
 
 def from_shn(text: str, source: str = "shn") -> dict:
@@ -135,18 +211,22 @@ def from_shn(text: str, source: str = "shn") -> dict:
     try:
         root = ET.fromstring(text)
     except ET.ParseError as exc:
-        raise FormatError(f"bad SHN xml: {exc}") from None
+        try:                                # files hand-edited or written by lenient tools
+            root = ET.fromstring(_repair_attrs(text))
+        except ET.ParseError:
+            raise FormatError(f"bad SHN xml: {exc}") from None
     if root.tag != "Trainer":
         raise FormatError("not an SHN trainer (no <Trainer>)")
-    cheats = []
+    raw = []
     for ch in root.findall("Cheat"):
-        lines = []
-        for cl in ch.findall("Cheatline"):
-            off = (cl.findtext("Offset") or "0").strip()
-            addr = _addr_expr(cl.findtext("Section"), off, _is_true(cl.findtext("Absolute") or ""))
-            lines.append((addr, _hex(cl.findtext("ValueOn") or ""), _hex(cl.findtext("ValueOff") or "")))
+        lines = [_line(cl.findtext("Section"), (cl.findtext("Offset") or "0").strip(),
+                       cl.findtext("ValueOn") or "", cl.findtext("ValueOff") or "",
+                       _is_true(cl.findtext("Absolute") or ""))
+                 for cl in ch.findall("Cheatline")
+                 if (cl.findtext("Offset") or "").strip() and (cl.findtext("ValueOn") or "").strip()]
         if lines:
-            cheats.append(_onoff_cheat(ch.get("Text") or "cheat", lines))
+            raw.append((ch.get("Text") or "cheat", lines, "toggle"))
+    cheats = _cheats_with_master(raw)
     tid = (root.get("Cusa") or "").strip().upper()
     return {"format": "ps5cheat/1", "game": root.get("Game") or tid or "game", "title_id": tid,
             "version": root.get("Version") or "", "process": root.get("Process") or "eboot.bin",
@@ -382,10 +462,20 @@ def load_any(path: Path) -> tuple[dict, list[str]]:
     data = path.read_bytes()
     if suf == ".mc4":
         return {"format": "ps5pack/1", "games": [from_shn(decrypt_mc4(data), "mc4")], "items": {}}, []
-    if suf == ".shn" or data.lstrip(b"\xef\xbb\xbf \r\n\t").startswith((b"<?xml", b"<Trainer")):
-        return {"format": "ps5pack/1", "games": [from_shn(data.decode("utf-8-sig", "replace"))], "items": {}}, []
+    if suf == ".shn" or data.lstrip(b"\xef\xbb\xbf \r\n\t").startswith((b"<?xml", b"<Trainer")) \
+            or data[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return {"format": "ps5pack/1", "games": [from_shn(_decode_text(data))], "items": {}}, []
     if suf == ".ps5c":
         return cheat_pack.parse(data), []
+    if suf == ".shnext" or (data[:1] not in (b"{", b"[") and not data.lstrip()[:1] in (b"{", b"[")):
+        import zlib
+        try:
+            inner = zlib.decompress(data, -15)
+        except zlib.error:
+            inner = b""
+        if b'"patchEntries"' in inner:
+            raise FormatError("this is an encrypted ShnExt - open it in the Cheat Player (it decrypts in "
+                              "memory), or import a decrypted ShnExt project (*.ProjReap or its folder)")
     try:
         d = json.loads(data.decode("utf-8-sig"))
     except Exception:

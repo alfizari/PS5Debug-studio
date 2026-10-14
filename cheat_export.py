@@ -39,8 +39,8 @@ MAIN_NAMES = ("", "main", "eboot.bin", "eboot", "executable")
 _IGNORED_OPS = ("log", "sleep")                 # no effect on memory: dropped silently
 _DROPPED_OPS = ("check",)                       # dropped with a warning
 
-_B1, _B2 = 0x10_0000_0000, 0x23_4560_0000     # two made-up load addresses
-_SPAN = 0x1_0000_0000                          # distance between made-up sections
+_SPAN = 1 << 40                                # distance between made-up sections (PS4 offsets can pass 4 GB)
+_B1, _B2 = 1 << 56, (1 << 56) + 0x2345_6000_0000 * 1024   # two made-up load addresses
 
 
 class _NotStatic(Exception):
@@ -55,6 +55,7 @@ class Line:
     off: Optional[bytes]        # None = still needs the original bytes
     addr: str                   # the cheat's address expression (to read the original bytes)
     what: str                   # step description for messages
+    absolute: bool = False      # offset is the real address (<Absolute>True</Absolute>)
 
 
 @dataclass
@@ -99,6 +100,7 @@ class _StaticRT(cheats_mod.Runtime):
 
 
 def _addr(rts, expr) -> tuple[int, int]:
+    """-> (section, offset); section -1 = an absolute address (offset is the address)"""
     try:
         a1, a2 = (rt.ev(expr) for rt in rts)
     except _NotStatic:
@@ -110,9 +112,13 @@ def _addr(rts, expr) -> tuple[int, int]:
         if "rax" in msg or "token" in msg:
             raise _NotStatic(f"address {expr!r} is not a fixed offset") from None
         raise _NotStatic(f"bad address {expr!r}: {exc}") from None
+    if a1 == a2:                                   # a plain number: GoldHEN "Absolute" line
+        return -1, a1
     if a1 - a2 != _B1 - _B2:
         raise _NotStatic(f"address {expr!r} is not module(main)+offset (an absolute address changes every run)")
     rel = a1 - _B1
+    if -_SPAN < rel < 0:                           # e.g. FFFFFFFFFFC04000: a cave just before the executable
+        return 0, rel & 0xFFFF_FFFF_FFFF_FFFF
     if rel < 0:
         raise _NotStatic(f"address {expr!r} is before the start of the game executable")
     return rel // _SPAN, rel % _SPAN
@@ -191,6 +197,14 @@ def analyze(game, cheat, fmt: str) -> Report:
             except KeyError as exc:
                 r.errors.append(f"step {i + 1} is missing {exc}")
                 continue
+            if sec < 0 and not off_side:
+                r.warnings.append(f"{_desc(s)} is an absolute address - written as an Absolute line, it only "
+                                  "works if the game always loads at the same place (PS4 games without ASLR)")
+            if once and s.get("button_off"):
+                try:
+                    data = (data, bytes.fromhex(re.sub(r"[^0-9A-Fa-f]", "", str(s["button_off"]))))
+                except ValueError:
+                    pass
             out.append((sec, off, data, op, str(s["addr"]), _desc(s)))
         return out
 
@@ -198,23 +212,18 @@ def analyze(game, cheat, fmt: str) -> Report:
     offs = walk(list(cheat.off), True)
     if not cheat.steps:
         r.errors.append("has no steps")
-    if fmt == "json":
-        for sec, off, *_ in ons + offs:
-            if sec:
-                r.errors.append(f"patches section {sec} (main#{sec}) - GoldHEN .json can only patch section 0 "
-                                "(export as .shn / .mc4 instead)")
-                break
     used = set()
     for sec, off, data, op, expr, what in ons:
-        line = Line(sec, off, data, None, expr, what)
+        data, button_off = data if isinstance(data, tuple) else (data, None)
+        line = Line(max(sec, 0), off, data, None, expr, what, absolute=sec < 0)
         if once:
-            line.off = data                              # GoldHEN buttons repeat the on value as off
+            line.off = button_off or data                # GoldHEN buttons: the file's off, else the on value
         else:
             for j, (s2, o2, d2, _op2, _e2, _w2) in enumerate(offs):
                 if j not in used and (s2, o2) == (sec, off):
-                    if len(d2) != len(data):
-                        r.errors.append(f"{what}: the off step writes {len(d2)} bytes but the on step writes "
-                                        f"{len(data)} - they must be the same length")
+                    if len(d2) != len(data):         # common in GoldHEN files and accepted there
+                        r.warnings.append(f"{what}: the off step writes {len(d2)} bytes but the on step writes "
+                                        f"{len(data)} - kept as written (GoldHEN accepts it)")
                     line.off = d2
                     used.add(j)
                     break
@@ -272,22 +281,42 @@ def fill_originals(reports: list, read: Callable[[str, int], bytes]) -> list:
 
 
 # ------------------------------------------------------------------ writers
+def _qattr(v: str) -> str:
+    """Always "..." with &quot; inside, like PS4 Trainer / GoldHEN files (onionHEN looks for Text=")."""
+    return '"' + escape(str(v), {'"': "&quot;"}) + '"'
+
+
 def _hy(b: bytes) -> str:
     return "-".join(f"{x:02X}" for x in b)
 
 
+def _absolute_first(reports: list) -> list:
+    """onionHEN looks for <Absolute> past the end of a Cheatline, so a normal line followed (anywhere
+    later in the file) by an Absolute line is read as absolute too.  Writing every Absolute line
+    before the normal ones avoids it; inside a cheat that also writes the cave before the jump."""
+    if not any(ln.absolute for r in reports for ln in r.lines):
+        return reports
+    for r in reports:
+        r.lines.sort(key=lambda ln: not ln.absolute)          # stable: keeps the order otherwise
+    return sorted(reports, key=lambda r: not any(ln.absolute for ln in r.lines))
+
+
 def build_shn(game, reports: list, declared: str = "utf-8") -> str:
+    reports = _absolute_first(reports)
     nl = "\r\n"
     tid = game.title_id.strip().upper()
     out = [f'<?xml version="1.0" encoding="{declared}"?>',
            '<Trainer xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"'
-           f" Game={quoteattr(game.name)} Moder={quoteattr(game.author or '')} Cusa={quoteattr(tid)}"
-           f" Version={quoteattr(game.version.strip())} Process={quoteattr(game.process or 'eboot.bin')}>",
+           f" Game={_qattr(game.name)} Moder={_qattr(game.author or '')} Cusa={_qattr(tid)}"
+           f" Version={_qattr(game.version.strip())} Process={_qattr(game.process or 'eboot.bin')}>",
            "  <Items />"]
     for r in reports:
-        out.append(f"  <Cheat Text={quoteattr(r.cheat.name)}>")
+        out.append(f"  <Cheat Text={_qattr(r.cheat.name)}>")
         for ln in r.lines:
-            out += ["    <Cheatline>",
+            out += ["    <Cheatline>"]
+            if ln.absolute:
+                out.append("      <Absolute>True</Absolute>")
+            out += [
                     f"      <Offset>{ln.offset:X}</Offset>",
                     f"      <Section>{ln.section}</Section>",
                     f"      <ValueOn>{_hy(ln.on)}</ValueOn>",
@@ -311,7 +340,9 @@ def build_json(game, reports: list) -> str:
             "name": r.cheat.name,
             "hint": (r.cheat.description or None),
             "type": "button" if r.cheat.mode == "once" else "checkbox",
-            "memory": [{"offset": f"{ln.offset:X}", "on": ln.on.hex().upper(), "off": ln.off.hex().upper()}
+            "memory": [{"offset": f"{ln.offset:X}", "on": ln.on.hex().upper(), "off": ln.off.hex().upper(),
+                        **({"section": str(ln.section)} if ln.section else {}),
+                        **({"absolute": True} if ln.absolute else {})}
                        for ln in r.lines],
         })
     d = {"name": game.name, "id": game.title_id.strip().upper(), "version": game.version.strip(),

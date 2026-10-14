@@ -359,6 +359,7 @@ class Runtime:
         self.vars: dict[str, int] = {}
         self.fparams: dict[str, float] = {}
         self.strs: dict[str, str] = {}      # string params, used as {name} in text
+        self.turning_off = False
         self._maps = None
 
     # -- helpers ---------------------------------------------------------
@@ -589,7 +590,7 @@ class Runtime:
             log(f"  free @{b.name}")
 
         elif op in ("write", "patch"):
-            addr = self.ev(s["addr"])
+            addr = self._site(s)
             data = self.encode(s["type"], s["value"], bool(s.get("nul", False)))
             if op == "patch":
                 self.undo.append((addr, c.read(pid, addr, len(data))))
@@ -713,6 +714,60 @@ class Runtime:
         self.vars[name] = addr
         log(f"  aob {aobmod.fmt(pat, mask)[:47]} -> ${name} = 0x{addr:X}")
 
+    # -- GoldHEN / PS4 compatibility: where does an imported line really go? -------
+    def _site(self, s: dict) -> int:
+        """Address of a write/patch step.  Two optional keys (set by the .shn/.mc4/.json importer):
+
+        "alt": "module(main)+0x..."  - a Section N line: the PS4 tools meant "offset into the Nth
+            mapping", onionHEN/GoldHEN-style loaders use "offset from the executable base".  The
+            one that holds the line's original bytes ("verify": {"off": hex, "on": hex}) wins.
+        "mc": {"addr": EXPR, "size": N, "offset": raw}  - a Master Code dependent ("... MC" cheat):
+            its bytes are found inside the code the Master Code wrote (like GoldHEN / onionHEN),
+            else the low byte of its offset is kept inside the master's 256-byte block.
+        The choice is remembered per game process, so turning the cheat off uses the same address."""
+        if "alt" not in s and "mc" not in s:
+            return self.ev(s["addr"])
+        picks = getattr(self.state, "site_picks", None)
+        if picks is None:
+            picks = self.state.site_picks = {}
+        key = (self.pid, str(s["addr"]))
+        if key in picks and (self.turning_off or picks[key][1]):
+            return picks[key][0]                 # off: same place as on; on: only re-use a verified pick
+        ver = s.get("verify") or {}
+        wants = [self.encode("hex", ver[k]) for k in ("off", "on") if str(ver.get(k) or "").strip()]
+        c, pid = self.client, self.pid
+        if "mc" in s:
+            mc = s["mc"]
+            maddr, size = self.ev(mc["addr"]), int(mc.get("size", 0))
+            buf = c.read(pid, maddr, size) if size > 0 else b""
+            hit = next((buf.find(w) for w in wants if w and buf.find(w) >= 0), -1)
+            if hit >= 0:
+                addr, how, done = maddr + hit, "found in the Master Code", True
+            else:
+                addr, how, done = ((maddr & ~0xFF) | (int(mc.get("offset", 0)) & 0xFF),
+                                   "Master Code block - not verified, is the Master Code on?", False)
+        else:
+            cands = []
+            for expr in (s["addr"], s["alt"]):
+                try:
+                    cands.append((self.ev(expr), str(expr)))
+                except CheatError:
+                    pass                          # e.g. the module has no section N
+            if not cands:
+                raise CheatError(f"neither {s['addr']} nor {s['alt']} can be resolved")
+            addr, how = cands[0][0], f"{cands[0][1]} (not verified)"
+            done = False
+            for w in wants:
+                for a, expr in cands:
+                    if w and c.read(pid, a, len(w)) == w:
+                        addr, how, done = a, expr, True
+                        break
+                if done:
+                    break
+        picks[key] = (addr, done)
+        self.log(f"  {s['addr']} -> 0x{addr:X} ({how})")
+        return addr
+
     # -- code cave hook ------------------------------------------------------
     def _alloc_near(self, site: int, size: int) -> int:
         """Executable memory within +-2 GB of `site` (needed for a 5-byte jump)."""
@@ -826,6 +881,7 @@ def execute(cheat: Cheat, game: Game, client, state, pid: int, make_buffer: Call
         if isinstance(pval, float):
             rt.fparams[pname] = pval
         rt.vars[pname] = int(pval) & M64
+    rt.turning_off = off
     if off:
         # restore newest first; an entry is dropped only once its write worked, so a failed
         # disable (game busy / connection hiccup) can simply be retried
