@@ -1,4 +1,34 @@
+# Python / build output
 __pycache__/
 *.pyc
-# private: never commit
+build/
+dist/
+*.spec
+
+# Your local data - remove a line if you want to publish it
+settings.json
+cheats/deleted/
+cheats/exports/
+tables/
+scripts/
+pointerscans/
+backup*/
+
+# PRIVATE: the ShnExt decryptor holds keys - never commit it
+cheat_player/shnext_decryptor.py
+cheat_player/build/
+cheat_player/dist/
+cheat_player/library/
+
+# Work folders that are not part of the tool
+pointer map c/
+other cheat format/
+pics/Screenshot*.png
+pics/assembler (2).png
+*.pdf
+*.docx
+PROTOCOL.md
+REVIEW_NOTES.md
+
+# private decryptor anywhere in the tree
 shnext_decryptor.py
