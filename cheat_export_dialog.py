@@ -18,6 +18,7 @@ from scrollable import fit_geometry
 
 import cheat_export as ce
 import cheat_pack
+import game_ids
 
 OWN = {
     "ps5c": ("Cheat pack for this tool (.ps5c) - keeps everything", ".ps5c"),
@@ -59,8 +60,8 @@ class ExportDialog:
             ttk.Radiobutton(ff, text=label, value=k, variable=self.fmt, command=self._changed,
                             state="disabled" if (k == "shnext" and sx_mod is None) else "normal").pack(anchor="w")
 
-        # ---- header (only used for the external formats; the game itself is not changed)
-        self.hf = hf = ttk.LabelFrame(top, text="Written into the file (your game entry is not changed)", padding=6)
+        # ---- header: written into the file in the standard spelling (game_ids)
+        self.hf = hf = ttk.LabelFrame(top, text="Written into the file", padding=6)
         self.hv = {}
         for i, (key, label, val, wd) in enumerate((
                 ("name", "Game", game.name, 30), ("title_id", "Title id", game.title_id, 12),
@@ -72,6 +73,9 @@ class ExportDialog:
             v.trace_add("write", lambda *_: self._refresh())
             ttk.Entry(hf, textvariable=v, width=wd).grid(row=row, column=2 * col + 1, sticky="w", pady=2)
             self.hv[key] = v
+        self.cid = game.content_id
+        self.fetch_btn = ttk.Button(hf, text="From console", command=self._from_console)
+        self.fetch_btn.grid(row=1, column=4, columnspan=2, sticky="e", pady=2)
         self.head_msg = ttk.Label(hf, text="", foreground="#c0392b", wraplength=900, justify="left")
         self.head_msg.grid(row=2, column=0, columnspan=6, sticky="w", pady=(4, 0))
 
@@ -112,8 +116,50 @@ class ExportDialog:
         g = copy.copy(self.game)
         for k, v in self.hv.items():
             setattr(g, k, v.get().strip())
-        g.title_id = g.title_id.upper()
+        d, _fixed = game_ids.normalize({"game": g.name, "title_id": g.title_id, "version": g.version,
+                                        "process": g.process, "content_id": self.cid})
+        g.name, g.title_id, g.version, g.process = d["game"], d["title_id"].upper(), d["version"], d["process"]
+        g.content_id = d.get("content_id", "")
         return g
+
+    def _from_console(self) -> None:
+        """Title id / version / process of the game running now, read like Reaper Studio does."""
+        self.head_msg.configure(text="Reading the game on the console...", foreground="#7f8c8d")
+
+        def done(run, err) -> None:
+            if not self.win.winfo_exists():
+                return
+            if run is None:
+                self.head_msg.configure(text=f"✖ could not read the game: {err}", foreground="#c0392b")
+                return
+            if self.hv["title_id"].get().strip() and self.hv["title_id"].get().strip().upper() != run.title_id:
+                if not messagebox.askyesno(
+                        "From console", f"The console is running {run.title_id}, but these cheats are for "
+                        f"{self.hv['title_id'].get().strip().upper()}.\n\nUse {run.title_id} anyway?", parent=self.win):
+                    self._refresh()
+                    return
+            self.cid = run.content_id
+            self.hv["title_id"].set(run.title_id)
+            if run.version:
+                self.hv["version"].set(run.version)
+            self.hv["process"].set(run.process or "eboot.bin")
+            g = self.game                     # remember them in the game entry too (same title only)
+            if g.title_id.upper() in ("", run.title_id) and g.path is not None and (
+                    g.title_id != run.title_id or (run.version and g.version != run.version)
+                    or (run.content_id and g.content_id != run.content_id)):
+                g.title_id, g.content_id = run.title_id, run.content_id or g.content_id
+                g.version = run.version or g.version
+                g.process = g.process or run.process or "eboot.bin"
+                try:
+                    g.save()
+                    self.app.log_line(f"{g.name}: title id / version from the console saved ({g.title_id} v{g.version})")
+                except Exception as exc:
+                    self.app.log_line(f"{g.name}: could not save the ids ({exc})")
+            self._changed()
+            if not run.version:
+                self.head_msg.configure(text=self.head_msg.cget("text") + "\n⚠ the console did not report a "
+                                        "version (older payload?) - type it in", foreground="#b9770e")
+        game_ids.ask_console(self.app, done)
 
     def _items(self) -> dict:
         """item ID lists the cheats use (ShnExt writes them as dropdown dictionaries)"""
@@ -127,8 +173,8 @@ class ExportDialog:
         own = fmt in OWN
         for f in (self.hf, self.lf, self.of):
             f.pack_forget()
+        self.hf.pack(fill="x", pady=(8, 0))             # every format: the same naming standard
         if not own:
-            self.hf.pack(fill="x", pady=(8, 0))
             self.of.pack(side="bottom", fill="x", pady=(6, 0))
             self.lf.pack(fill="both", expand=True, pady=(8, 0))
         self.reports = [] if own else [ce.analyze(self._hdr_game(), c, fmt, self._items()) for c in self.cheats]
@@ -136,6 +182,14 @@ class ExportDialog:
             for ln in r.missing_off():
                 ln.off = self._orig.get((ln.addr, len(ln.on)))
         self._refresh()
+
+    def _show_head(self, errs: list, warns: list) -> None:
+        hg = self._hdr_game()
+        fixed = [f"{k} {getattr(hg, a)!r}" for k, a in (("version", "version"), ("title id", "title_id"))
+                 if self.hv[a].get().strip() and getattr(hg, a) != self.hv[a].get().strip()]
+        info = (["✔ written as " + ", ".join(fixed)] if fixed else [])
+        self.head_msg.configure(text="\n".join(["✖ " + e for e in errs] + ["⚠ " + x for x in warns] + info),
+                                foreground="#c0392b" if errs else "#b9770e")
 
     def _refresh(self) -> None:
         fmt = self.fmt.get()
@@ -148,12 +202,13 @@ class ExportDialog:
                 txt += f" \u00b7 includes {len(have)} item ID list(s): {', '.join(have)}"
             if missing:
                 txt += f" \u00b7 \u26a0 item list(s) not found in this project: {', '.join(missing)}"
+            errs, warns = ce.check_game(self._hdr_game(), fmt)
+            self._show_head(errs, warns)
             self.summary.configure(text=txt)
-            self.go.configure(text=f"Export {len(self.cheats)} cheat(s)...", state="normal")
+            self.go.configure(text=f"Export {len(self.cheats)} cheat(s)...", state="disabled" if errs else "normal")
             return
         errs, warns = ce.check_game(self._hdr_game(), fmt)
-        self.head_msg.configure(text="\n".join(["✖ " + e for e in errs] + ["⚠ " + x for x in warns]),
-                                foreground="#c0392b" if errs else "#b9770e")
+        self._show_head(errs, warns)
         self.tree.delete(*self.tree.get_children())
         need = 0
         for i, r in enumerate(self.reports):
@@ -252,11 +307,13 @@ class ExportDialog:
 
     def _export(self) -> None:
         fmt = self.fmt.get()
-        g = self.game
         if fmt in OWN:
+            g = self._hdr_game()
+            if ce.check_game(g, fmt)[0]:
+                return
             ext = OWN[fmt][1]
-            name = cheat_pack._slug(g.title_id or g.name) + ("" if len(self.cheats) == len(g.cheats)
-                                                              else "_" + cheat_pack._slug(self.cheats[0].name))
+            name = game_ids.file_stem(g.title_id, g.version, g.name) + (
+                "" if len(self.cheats) == len(self.game.cheats) else "_" + cheat_pack._slug(self.cheats[0].name))
             path = filedialog.asksaveasfilename(parent=self.win, title="Export cheats", defaultextension=ext,
                                                 initialdir=self._exports_dir(),
                                                 initialfile=name + ext, filetypes=[(OWN[fmt][0], "*" + ext)])

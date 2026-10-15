@@ -30,7 +30,11 @@ CHEAT FILE FORMAT  (ps5cheat/1, JSON, one file per game in ./cheats)
 {
   "format": "ps5cheat/1",
   "game": "Game Name", "title_id": "PPSA01234", "version": "01.000.000",
+  "content_id": "UP0000-PPSA01234_00-GAMENAME00000000",   (optional)
   "process": "eboot.bin", "author": "you",
+  (title_id / version / content_id: press "From console" with the game running - the app
+   version comes from the game's param.sfo, 01.03 on PS4, 01.000.000 on PS5;
+   files are named <TITLEID>_<VERSION>.json, like GoldHEN / ShnExt cheat files)
   "cheats": [
     { "name": "Infinite Health", "mode": "toggle" | "once",
       "description": "...", "steps": [ ... ], "off": [ ... ] }
@@ -442,7 +446,7 @@ class CheatsEditorTab:
             )
             self.editor.insert(
                 "1.0",
-                json.dumps(g.meta_dict(), indent=2)
+                json.dumps(g.meta_dict(full=True), indent=2)
             )
 
         else:
@@ -769,12 +773,9 @@ class CheatsEditorTab:
         try:
             data = json.loads(self.editor.get("1.0", "end-1c"))
             if ci is None:
-                game.name = str(data.get("game", game.name))
-                game.title_id = str(data.get("title_id", "")).upper()
-                game.version = str(data.get("version", ""))
-                game.process = str(data.get("process", ""))
-                game.author = str(data.get("author", ""))
-                game.notes = str(data.get("notes", ""))
+                fixed = game.apply_meta(data)
+                if fixed:
+                    self.app.log_line(f"{game.name}: " + "; ".join(fixed))
                 sel_key = None
             else:
                 old = game.cheats[ci]
@@ -790,22 +791,13 @@ class CheatsEditorTab:
         self._fill(select=sel_key)
         self.app.log_line(f"saved {game.path.name if game.path else game.name}")
 
-    def _free_game_path(self, tid: str, name: str) -> tuple[Path, bool]:
-        """-> (file path, dated).  The first file of a game is <TITLEID>.json; more files for the same
-        game get the date appended (<TITLEID>_2026-10-12.json, then _2026-10-12_2 ...)."""
-        base = _slug(tid or name)
-        path = self.folder / f"{base}.json"
-        same = any(g.title_id and tid and g.title_id.upper() == tid.upper() for g in self.games)
-        if not path.exists() and not same:
-            return path, False
-        day = datetime.date.today().isoformat()
-        path, n = self.folder / f"{base}_{day}.json", 1
-        while path.exists():
-            n += 1
-            path = self.folder / f"{base}_{day}_{n}.json"
-        return path, True
+    def _new_game_path(self, tid: str, ver: str, name: str) -> Path:
+        """<TITLEID>_<VERSION>.json (the name GoldHEN / ShnExt cheat files use), _2, _3 ... if taken."""
+        import game_ids  # noqa: PLC0415
+        return game_ids.library_path(self.folder, tid, ver, name)
 
     def on_new_game(self) -> None:
+        import game_ids  # noqa: PLC0415
         sel = self._selection()
         src: Optional[Game] = sel[0] if sel else None
         win = tk.Toplevel(self.app.root)
@@ -817,40 +809,84 @@ class CheatsEditorTab:
         name_v = tk.StringVar(value=src.name if src else "")
         tid_v = tk.StringVar(value=src.title_id if src else "")
         ver_v = tk.StringVar(value=src.version if src else "")
+        cid_v = tk.StringVar(value=src.content_id if src else "")
+        proc_v = tk.StringVar(value=(src.process if src else "") or "eboot.bin")
         copy_v = tk.BooleanVar(value=False)
-        for r, (label, var) in enumerate((("Game name", name_v), ("Title ID (e.g. PPSA01234)", tid_v),
-                                          ("Version", ver_v))):
+        rows = (("Game name", name_v, 36), ("Title ID (CUSA#####, PPSA#####)", tid_v, 14),
+                ("App version (01.03 / 01.000.000)", ver_v, 14), ("Content ID (optional)", cid_v, 40),
+                ("Process", proc_v, 14))
+        for r, (label, var, wd) in enumerate(rows):
             ttk.Label(f, text=label).grid(row=r, column=0, sticky="w", pady=2)
-            ttk.Entry(f, textvariable=var, width=36).grid(row=r, column=1, sticky="we", padx=(6, 0), pady=2)
+            ttk.Entry(f, textvariable=var, width=wd).grid(row=r, column=1, sticky="w", padx=(6, 0), pady=2)
+        fetch = ttk.Button(f, text="From console")
+        fetch.grid(row=1, column=1, sticky="e", padx=(6, 0))
+        status = tk.StringVar(value="")
+        ttk.Label(f, textvariable=status, foreground=theme.c("muted"), wraplength=420,
+                  justify="left").grid(row=5, column=0, columnspan=2, sticky="w", pady=(4, 0))
         note = tk.StringVar()
-        ttk.Label(f, textvariable=note, foreground=theme.c("muted"), wraplength=360,
-                  justify="left").grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 2))
+        ttk.Label(f, textvariable=note, foreground=theme.c("muted"), wraplength=420,
+                  justify="left").grid(row=6, column=0, columnspan=2, sticky="w", pady=(2, 2))
         if src:
             ttk.Checkbutton(f, text=f"Copy the {len(src.cheats)} cheat(s) of '{src.name}'",
-                            variable=copy_v).grid(row=4, column=0, columnspan=2, sticky="w")
+                            variable=copy_v).grid(row=7, column=0, columnspan=2, sticky="w")
+
+        def meta() -> dict:
+            d, _fixed = game_ids.normalize({"game": name_v.get().strip(), "title_id": tid_v.get().strip(),
+                                            "version": ver_v.get().strip(), "content_id": cid_v.get().strip(),
+                                            "process": proc_v.get().strip()})
+            return d
 
         def preview(*_a) -> None:
-            tid = tid_v.get().strip().upper()
-            path, dated = self._free_game_path(tid, name_v.get().strip() or "game")
-            note.set(f"Saved as {path.name}" + ("  (this game already has a file, so the date is added to "
-                                                "the file and the name)" if dated else ""))
-        for v in (name_v, tid_v):
+            d = meta()
+            path = self._new_game_path(d["title_id"], d["version"], d["game"])
+            msgs = [f"Saved as {path.name}"]
+            if d["title_id"] and not game_ids.TITLE_ID_FULL.fullmatch(d["title_id"]):
+                msgs.append("the title id must be CUSA##### or PPSA#####")
+            if d["version"] and not game_ids.version_ok(d["version"], d["title_id"]):
+                msgs.append(f"version {d['version']!r} is not an app version (01.03 on PS4, 01.000.000 on PS5)")
+            elif not d["version"]:
+                msgs.append("no version yet - cheat menus look for <TITLEID>_<VERSION> files")
+            note.set("  -  ".join(msgs))
+        for v in (name_v, tid_v, ver_v, cid_v):
             v.trace_add("write", preview)
         preview()
 
+        def fill(run, err) -> None:
+            if not win.winfo_exists():
+                return
+            if run is None:
+                status.set(f"Could not read the game: {err}")
+                return
+            tid_v.set(run.title_id)
+            ver_v.set(run.version)
+            cid_v.set(run.content_id)
+            proc_v.set(run.process or "eboot.bin")
+            if not name_v.get().strip() or name_v.get().strip().upper() in (run.title_id, run.content_id):
+                known = next((g.name for g in self.games if g.title_id == run.title_id), "")
+                name_v.set(re.sub(r"\s*\((?:\d{4}-\d{2}-\d{2}|imported).*\)$", "", known) or run.title_id)
+            status.set(f"From the console: {run.title_id}  v{run.version or '?'}  {run.content_id}"
+                       + ("" if run.version else "  (no version reported - type it in)")
+                       + ("" if name_v.get().strip() != run.title_id else "  - type the game's name"))
+
+        fetch.configure(command=lambda: (status.set("Reading the game on the console..."),
+                                         game_ids.ask_console(self.app, fill)))
+        if not src and getattr(getattr(self.app, "client", None), "connected", False):
+            fetch.invoke()                         # connected: fill the ids of the running game right away
+
         def ok() -> None:
-            name, tid = name_v.get().strip(), tid_v.get().strip().upper()
-            if not name:
+            d = meta()
+            name, tid = d["game"], d["title_id"]
+            if not name_v.get().strip():
                 messagebox.showerror("New game", "Enter a game name", parent=win)
                 return
-            path, dated = self._free_game_path(tid, name)
-            if dated:
-                stamp = path.stem[len(_slug(tid or name)) + 1:].replace("_", " #")
-                name = f"{name} ({stamp})"
-            g = Game(name=name, title_id=tid, version=ver_v.get().strip(), path=path,
-                     author=self.app.author() if hasattr(self.app, "author") else "", process="eboot.bin")
+            path = self._new_game_path(tid, d["version"], name)
+            base, k = name, 2
+            while any(g.name == name for g in self.games):
+                name, k = f"{base} ({k})", k + 1
+            g = Game(name=name, title_id=tid, version=d["version"], path=path, content_id=d.get("content_id", ""),
+                     author=self.app.author() if hasattr(self.app, "author") else "", process=d["process"])
             if src:
-                g.process, g.author, g.notes = src.process, src.author, src.notes
+                g.author, g.notes = src.author or g.author, src.notes
             if src and copy_v.get():
                 g.cheats = [Cheat.from_dict(c.to_dict()) for c in src.cheats]
             else:
@@ -866,7 +902,7 @@ class CheatsEditorTab:
             self._select_game(path)
 
         b = ttk.Frame(f)
-        b.grid(row=5, column=0, columnspan=2, sticky="e", pady=(10, 0))
+        b.grid(row=8, column=0, columnspan=2, sticky="e", pady=(10, 0))
         ttk.Button(b, text="Create", style="Accent.TButton", command=ok).pack(side="left", padx=2)
         ttk.Button(b, text="Cancel", command=win.destroy).pack(side="left", padx=2)
         win.bind("<Return>", lambda e: ok())

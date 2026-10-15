@@ -106,6 +106,8 @@ class Snapshot:
     rip: int
     args: list[ArgSnap]
     patches: list[tuple[int, bytes, bytes]] = field(default_factory=list)  # addr, new, orig
+    version: str = ""                          # app version of the game (when it is the game in front)
+    content_id: str = ""
     warnings: list[str] = field(default_factory=list)
     code: dict = field(default_factory=dict)   # quick-code buffer name -> {asm, vars, prot, auto_ret}
     view: Optional[tuple] = None               # (base, current bytes, original bytes) of the hex view
@@ -119,9 +121,11 @@ def prot_letters(p: int) -> str:
 def collect(app, pid: int, rip: int, args: list[ArgSnap], patches) -> Snapshot:
     """Runs in a background thread (talks to the console)."""
     client = app.client
-    info = client.proc_info(pid)
+    import game_ids  # noqa: PLC0415
+    run = game_ids.from_console(client, pid)
     maps = client.maps(pid)
-    snap = Snapshot(pid, info.titleid.strip().upper(), info.name, maps, [], rip, args, patches)
+    snap = Snapshot(pid, run.title_id, run.process, maps, [], rip, args, patches,
+                    version=run.version, content_id=run.content_id)
     live = {b.name for b in app.state.buffers}
     snap.code = {n: dict(v) for n, v in getattr(app, "code_sources", {}).items() if n in live}
     values = [rip] + [a.value for a in args]
@@ -348,7 +352,8 @@ class RecordDialog:
 
         v = tk.StringVar
         self.game_choice = v()
-        self.game_name = v(value=snap.proc_name or snap.title_id or "New game")
+        known = next((g.name for g in getattr(app.cheats_editor, "games", []) if snap.title_id and g.title_id == snap.title_id), "")
+        self.game_name = v(value=known or snap.title_id or "New game")   # the console reports no game titles
         self.title_id = v(value=snap.title_id)
         self.cheat_name = v(value="New cheat")
         self.desc = v()
@@ -380,7 +385,9 @@ class RecordDialog:
 
         # ---- left: metadata + options
         names = [f"{g.name} [{g.title_id}]" for g in tab.games]
-        match = next((n for n, g in zip(names, tab.games) if snap.title_id and g.title_id == snap.title_id), self.NEW)
+        match = next((n for n, g in zip(names, tab.games) if snap.title_id and g.title_id == snap.title_id
+                      and snap.version and g.version == snap.version), None) or \
+            next((n for n, g in zip(names, tab.games) if snap.title_id and g.title_id == snap.title_id), self.NEW)
         self.game_choice.set(match)
         ttk.Label(left, text="Save into").pack(anchor="w")
         ttk.Combobox(left, textvariable=self.game_choice, values=names + [self.NEW],
@@ -710,10 +717,13 @@ class RecordDialog:
             if choice == self.NEW:
                 tid = self.title_id.get().strip().upper()
                 gname = self.game_name.get().strip() or tid or "New game"
-                path = tab.folder / f"{re.sub(r'[^A-Za-z0-9_.-]+', '_', tid or gname).strip('_')}.json"
-                if path.exists():
-                    raise ValueError(f"{path.name} already exists - pick it in 'Save into'")
-                game = Game(name=gname, title_id=tid, process=self.snap.proc_name, path=path)
+                import game_ids  # noqa: PLC0415
+                same = tid == self.snap.title_id
+                ver = self.snap.version if same else ""
+                path = game_ids.library_path(tab.folder, tid, ver, gname)
+                game = Game(name=gname, title_id=tid, version=ver, process=self.snap.proc_name or "eboot.bin",
+                            path=path, content_id=self.snap.content_id if same else "",
+                            author=tab.app.author() if hasattr(tab.app, "author") else "")
             else:
                 game = tab.games[[f"{g.name} [{g.title_id}]" for g in tab.games].index(choice)]
             base, n = name, 1

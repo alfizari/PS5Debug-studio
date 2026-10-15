@@ -23,7 +23,11 @@ CHEAT FILE FORMAT  (ps5cheat/1, JSON, one file per game in ./cheats)
 {
   "format": "ps5cheat/1",
   "game": "Game Name", "title_id": "PPSA01234", "version": "01.000.000",
+  "content_id": "UP0000-PPSA01234_00-GAMENAME00000000",   (optional)
   "process": "eboot.bin", "author": "you",
+  (title_id / version / content_id: press "From console" with the game running - the app
+   version comes from the game's param.sfo, 01.03 on PS4, 01.000.000 on PS5;
+   files are named <TITLEID>_<VERSION>.json, like GoldHEN / ShnExt cheat files)
   "cheats": [
     { "name": "Infinite Health", "mode": "toggle" | "once",
       "description": "...", "steps": [ ... ], "off": [ ... ] }
@@ -235,7 +239,7 @@ class CheatsTab:
         if ci is None:
             self.info_var.set(f"{g.name}  [{g.title_id}]  v{g.version}  {g.author}")
             self.desc_var.set(f"{len(g.cheats)} cheat(s)  -  {g.path.name if g.path else ''}")
-            self.editor.insert("1.0", json.dumps(g.meta_dict(), indent=2))
+            self.editor.insert("1.0", json.dumps(g.meta_dict(full=True), indent=2))
         else:
             c = g.cheats[ci]
             self.info_var.set(f"{g.name}  >  {c.name}   ({c.mode})")
@@ -441,12 +445,9 @@ class CheatsTab:
         try:
             data = json.loads(self.editor.get("1.0", "end-1c"))
             if ci is None:
-                game.name = str(data.get("game", game.name))
-                game.title_id = str(data.get("title_id", "")).upper()
-                game.version = str(data.get("version", ""))
-                game.process = str(data.get("process", ""))
-                game.author = str(data.get("author", ""))
-                game.notes = str(data.get("notes", ""))
+                fixed = game.apply_meta(data)
+                if fixed:
+                    self.app.log_line(f"{game.name}: " + "; ".join(fixed))
                 sel_key = None
             else:
                 old = game.cheats[ci]
@@ -467,11 +468,12 @@ class CheatsTab:
         if not name:
             return
         tid = simpledialog.askstring("New game", "Title ID (e.g. PPSA01234):", parent=self.app.root) or ""
-        path = self.folder / f"{_slug(tid or name)}.json"
-        if path.exists():
-            messagebox.showerror("Cheats", f"{path.name} already exists")
-            return
-        g = Game(name=name, title_id=tid.strip().upper(), path=path)
+        ver = simpledialog.askstring("New game", "App version (01.03 on PS4, 01.000.000 on PS5):",
+                                     parent=self.app.root) or ""
+        import game_ids  # noqa: PLC0415
+        d, _fixed = game_ids.normalize({"game": name, "title_id": tid.strip(), "version": ver.strip()})
+        path = game_ids.library_path(self.folder, d["title_id"], d["version"], name)
+        g = Game(name=name, title_id=d["title_id"], version=d["version"], process=d["process"], path=path)
         g.cheats.append(self._template())
         g.save()
         self.reload()

@@ -206,33 +206,58 @@ class Game:
     cheats: list[Cheat] = field(default_factory=list)
     path: Optional[Path] = None
     source: str = ""                # file the cheats were imported from (keeps imports apart)
+    content_id: str = ""            # e.g. UP0700-CUSA08155_00-DARKSOULS3BST000 (from the console)
+    fixed: list = field(default_factory=list, repr=False, compare=False)  # naming fixes made on load
 
     @staticmethod
     def from_dict(d: dict, path: Optional[Path] = None) -> "Game":
-        if not isinstance(d, dict) or not d.get("game"):
+        if not isinstance(d, dict) or not (d.get("game") or d.get("title_id") or d.get("content_id")):
             raise CheatError("file needs a 'game' name")
+        import game_ids  # noqa: PLC0415
+        # older files: lower-case / missing ids, "1.3" versions, empty process -> the standard spelling
+        d2, fixed = game_ids.normalize(d, path.name if path else "")
         g = Game(
-            name=str(d["game"]),
-            title_id=str(d.get("title_id", "")).upper(),
-            version=str(d.get("version", "")),
-            process=str(d.get("process", "")),
+            name=str(d2["game"]),
+            title_id=str(d2.get("title_id", "")).upper(),
+            version=str(d2.get("version", "")),
+            process=str(d2.get("process", "")),
             author=str(d.get("author", "")),
             notes=str(d.get("notes", "")),
             path=path,
             source=str(d.get("source", "")),
+            content_id=str(d2.get("content_id", "")),
+            fixed=fixed,
         )
         for c in d.get("cheats", []):
             g.cheats.append(Cheat.from_dict(c))
         return g
 
-    def meta_dict(self) -> dict:
+    def meta_dict(self, full: bool = False) -> dict:
+        """full: always list content_id (for the editor), even while it is empty"""
         d = {
             "game": self.name, "title_id": self.title_id, "version": self.version,
             "process": self.process, "author": self.author, "notes": self.notes,
         }
+        if self.content_id or full:
+            d["content_id"] = self.content_id
         if self.source:
             d["source"] = self.source
         return d
+
+    def apply_meta(self, data: dict) -> list[str]:
+        """Set name / ids / version / process / author / notes from an edited header, in the standard
+        spelling (game_ids).  Returns what was corrected."""
+        import game_ids  # noqa: PLC0415
+        d, fixed = game_ids.normalize({k: data.get(k, "") for k in ("game", "title_id", "content_id",
+                                                                     "version", "process")})
+        self.name = str(d["game"]) or self.name
+        self.title_id = str(d.get("title_id", "")).upper()
+        self.content_id = str(d.get("content_id", ""))
+        self.version = str(d.get("version", ""))
+        self.process = str(d.get("process", ""))
+        self.author = str(data.get("author", ""))
+        self.notes = str(data.get("notes", ""))
+        return fixed
 
     def to_dict(self) -> dict:
         d = {"format": FORMAT}
@@ -876,6 +901,28 @@ class Runtime:
         return bits
 
 
+_VERSION_WARNED: set = set()
+
+
+def _warn_version(client, pid: int, game: Game, log: Callable[[str], None]) -> None:
+    """Cheats made for another app version usually patch the wrong code: say so (once per game + pid)."""
+    key = (pid, game.title_id, game.version)
+    if key in _VERSION_WARNED:
+        return
+    _VERSION_WARNED.add(key)
+    try:
+        import game_ids  # noqa: PLC0415
+        fg = client.foreground_app()
+    except Exception:
+        return                                       # older payload: no version to compare
+    if fg.pid != pid or not fg.app_ver:
+        return
+    running = game_ids.version(fg.app_ver, game.title_id)
+    if running and running != game.version:
+        log(f"WARNING: {game.name} is for version {game.version}, the game running is version {running} - "
+            "offsets may be different (AOB cheats usually still work)")
+
+
 def execute(cheat: Cheat, game: Game, client, state, pid: int, make_buffer: Callable,
             log: Callable[[str], None], undo: list, off: bool = False,
             verify_title: bool = True, params: Optional[dict] = None) -> None:
@@ -884,6 +931,8 @@ def execute(cheat: Cheat, game: Game, client, state, pid: int, make_buffer: Call
         info = client.proc_info(pid)
         if info.titleid.strip().upper() != game.title_id.upper():
             raise TitleMismatch(pid, info.titleid.strip(), game.title_id.upper())
+        if not off and game.version:
+            _warn_version(client, pid, game, log)
     rt = Runtime(client, state, pid, make_buffer, log, undo)
     rt.ftypes = {str(p.get("name")): str(p.get("type", "")).lower() for p in (cheat.params or [])
                  if isinstance(p, dict) and str(p.get("type", "")).lower() in FLOAT_TYPES}

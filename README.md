@@ -187,12 +187,31 @@ lists and the `exports\` folder. Switch, create or open projects at the top of t
 | `.shn` | on/off byte patches | GoldHEN / etaHEN cheat menus |
 | `.mc4` | same as `.shn`, encrypted | cheat menus that load `.mc4` |
 | GoldHEN `.json` | on/off patches and buttons | GoldHEN / etaHEN cheat menus |
+| `.ShnExt` | AOB finders, hooks, code caves, inputs and item dropdowns (when the private ShnExt module is built in) | onionHEN / ShnExt |
 
-The console cheat formats can only hold fixed patches of the game executable, so every cheat is
-checked first. Cheats that use code caves allocated at run time, hooks, AOB scans, pointers, inputs or
-Python are listed with the reason and left out - nothing is written half-converted. Missing *off*
-values (the original bytes) can be read straight from the running game. Files are named
-`TITLEID_VERSION.ext` as the cheat menus expect.
+`.shn`, `.mc4` and GoldHEN `.json` can only hold fixed patches of the game executable, so every cheat
+is checked first. Cheats they cannot hold (code caves allocated at run time, hooks, AOB scans,
+pointers, inputs, Python) are listed with the reason and left out - nothing is written half-converted.
+Missing *off* values (the original bytes) can be read straight from the running game.
+
+### Game names, title ids and versions
+
+Every game entry and every export follows the standard the cheat menus and ShnExt / Reaper Studio use:
+
+| Field | Example | Where it comes from |
+| --- | --- | --- |
+| Title id | `CUSA08155`, `PPSA01341` | the running game (**From console**) |
+| App version | `01.03` (PS4), `01.004.000` (PS5) | the game's `param.sfo` (`APP_VER` / `VERSION`), else `param.json`, read by ps5debug-NG |
+| Content id | `UP0700-CUSA08155_00-DARKSOULS3BST000` | the running game (optional) |
+| Process | `eboot.bin` | the running game |
+| File name | `CUSA08155_01.03.json`, `PPSA01341_01.004.000.ps5c` | title id + version |
+
+**From console** (New game, Export) fills these with the game running; the game's name is yours to
+type, since the console does not report titles. Older cheat files are corrected when they are loaded
+or imported: lower-case ids, ids found in the name or content id, versions like `1.4` or `v01.03`
+written in full, an empty process set to `eboot.bin`. The untouched original of a library file is
+kept in `deleted\<name>_before_naming.json`. Cheats for different versions of a game are never merged
+into one file, and turning on a cheat made for another version writes a warning to the log.
 
 ## Building the .exe
 
@@ -217,7 +236,8 @@ the icon, and on the first build copies your `cheats`, `tables`, `scripts`, `poi
 | `func_logger.py`, `func_logger_window.py` | Function logger |
 | `codecave.py`, `codecave_dialog.py`, `asmgen.py`, `aob.py` | Hooks, assembler, AOB signatures |
 | `cheats.py`, `cheats_store.py`, `cheats_play_tab.py`, `cheats_editor_tab.py` | Cheat engine and the two cheat tabs |
-| `cheat_formats.py`, `cheat_export.py`, `cheat_export_dialog.py`, `cheat_pack.py` | Import / export of cheat formats |
+| `cheat_formats.py`, `cheat_export.py`, `cheat_export_dialog.py`, `cheat_pack.py`, `shnext_model.py` | Import / export of cheat formats (ShnExt AOBs / hooks / caves in `shnext_model.py`) |
+| `game_ids.py` | Title id / content id / app version naming standard, read from the running game |
 | `cheat_recorder.py`, `cheat_tools.py`, `items.py`, `bulk_items.py`, `projects.py` | Recording, checks, item ID lists, projects |
 | `script_api.py`, `script_window.py` | Python scripting |
 | `klog_tab.py` | Kernel log |

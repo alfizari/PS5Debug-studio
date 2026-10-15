@@ -60,6 +60,18 @@ class CheatsStore:
         self.games, errors = load_games(self.folder)
         for e in errors:
             self.app.log_line(f"cheat file error: {e}")
+        for g in self.games:                      # older files: save them in the standard spelling
+            if g.fixed and g.path is not None:
+                try:
+                    keep = self.folder / "deleted" / f"{g.path.stem}_before_naming.json"
+                    if not keep.exists():                 # the untouched original, just in case
+                        keep.parent.mkdir(parents=True, exist_ok=True)
+                        keep.write_bytes(g.path.read_bytes())
+                    g.save()
+                    self.app.log_line(f"{g.path.name}: updated to the naming standard ({'; '.join(g.fixed)})")
+                except Exception as exc:
+                    self.app.log_line(f"{g.path.name}: could not update ({exc})")
+                g.fixed = []
         total = sum(len(g.cheats) for g in self.games)
         self.app.log_line(f"loaded {len(self.games)} game file(s), {total} cheat(s)")
         self._notify()

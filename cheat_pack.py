@@ -109,29 +109,42 @@ def merge_into(pack: dict, games: list[Game], folder: Path, items_store=None,
             cur.update(added)
             path.write_text(json.dumps(cur, indent=2, ensure_ascii=False), encoding="utf-8")
             log.append(f"item list '{lst}': {len(added)} item(s) added")
+    import game_ids  # noqa: PLC0415
     for gd in pack["games"]:
-        src = Game.from_dict(gd)
+        src = Game.from_dict(gd)            # older files are corrected to the naming standard here
+        if src.fixed:
+            log.append(f"{src.name}: " + "; ".join(src.fixed))
         tid = src.title_id.upper()
         many = len(pack["games"]) > 1
         tag = f"{source}" + (f" #{tid or src.name}" if many else "") if source else ""
+
+        def same_version(g: Game) -> bool:     # cheats for another app version never mix (offsets differ)
+            return not src.version or not g.version or g.version == src.version
         if tag:
             dst = next((g for g in games if g.source == tag), None)
         else:
-            dst = next((g for g in games if tid and g.title_id.upper() == tid and not g.source), None) or \
+            dst = next((g for g in games if tid and g.title_id.upper() == tid and not g.source
+                        and g.version == src.version), None) or \
+                next((g for g in games if tid and g.title_id.upper() == tid and not g.source and same_version(g)), None) or \
                 next((g for g in games if not tid and g.name == src.name and not g.source), None)
         if dst is None:
-            stem = _slug(Path(source).stem + "_" + Path(source).suffix.lstrip(".") if source else (tid or src.name))
-            if source and many:
-                stem += "_" + _slug(tid or src.name)
-            path = folder / f"{stem}.json"
-            n = 2
-            while path.exists():
-                path = folder / f"{stem}_{n}.json"
-                n += 1
+            ext = Path(source).suffix.lstrip(".") if source else ""
+            if ext.lower() in ("ps5c", "json"):
+                ext = ""                       # this tool's own files: just <TITLEID>_<VERSION>.json
+            if tid:
+                path = game_ids.library_path(folder, tid, src.version, src.name, suffix=ext)
+            else:
+                stem = _slug(Path(source).stem + "_" + ext if source else src.name)
+                path = game_ids.library_path(folder, "", "", stem)
             name = f"{src.name} ({source})" if source else src.name
-            dst = Game(name, src.title_id, src.version, src.process, src.author, src.notes, [], path, tag)
+            dst = Game(name, src.title_id, src.version, src.process, src.author, src.notes, [], path, tag,
+                       content_id=src.content_id)
             games.append(dst)
             log.append(f"new game file {path.name}")
+        else:                                  # fill what the existing entry does not know yet
+            dst.version = dst.version or src.version
+            dst.content_id = dst.content_id or src.content_id
+            dst.process = dst.process or src.process
         added = skipped = 0
         for c in src.cheats:
             same = next((x for x in dst.cheats if x.name == c.name), None)

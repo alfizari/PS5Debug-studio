@@ -560,13 +560,12 @@ class CodeCaveDialog:
         app = self.app
 
         def work() -> None:
-            tid, pname = "", ""
+            import game_ids  # noqa: PLC0415
             try:
-                info = app.client.proc_info(pid)
-                tid, pname = info.titleid.strip().upper(), info.name
+                run = game_ids.from_console(app.client, pid)
             except Exception:
-                pass
-            app.root.after(0, lambda: SaveCheatDialog(self, step, tid, pname, params))
+                run = game_ids.RunningGame(pid, "", "", "", "")
+            app.root.after(0, lambda: SaveCheatDialog(self, step, run.title_id, run.process, params, run))
 
         app._run_bg(work, "Reading title id...")
 
@@ -575,8 +574,10 @@ class SaveCheatDialog:
     NEW = "(new game file)"
 
     def __init__(self, cave: CodeCaveDialog, step: dict, title_id: str, proc_name: str,
-                 params: Optional[list] = None) -> None:
+                 params: Optional[list] = None, run=None) -> None:
         self.cave, self.proc_name = cave, proc_name
+        self.run = run                                # game_ids.RunningGame: version + content id
+        ver = getattr(run, "version", "")
         self.params = list(params or [])
         self.steps = step if isinstance(step, list) else [step]
         self.step = self.steps[-1]
@@ -597,11 +598,12 @@ class SaveCheatDialog:
         self.mode = tk.StringVar(value="toggle")
         games = [f"{g.name} [{g.title_id}]" for g in self.ed.games]
         default = self.NEW
-        for label, g in zip(games, self.ed.games):
-            if title_id and g.title_id == title_id:
+        for label, g in zip(games, self.ed.games):       # same title id; the same version wins
+            if title_id and g.title_id == title_id and (default == self.NEW or (ver and g.version == ver)):
                 default = label
         self.choice = tk.StringVar(value=default)
-        self.gname = tk.StringVar(value=title_id or "New game")
+        known = next((g.name for g in self.ed.games if title_id and g.title_id == title_id), "")
+        self.gname = tk.StringVar(value=known or title_id or "New game")
         self.tid = tk.StringVar(value=title_id)
 
         rows = [("Cheat name", ttk.Entry(f, textvariable=self.name, width=44)),
@@ -644,10 +646,14 @@ class SaveCheatDialog:
             if self.choice.get() == self.NEW:
                 tid = self.tid.get().strip().upper()
                 gname = self.gname.get().strip() or tid or "New game"
-                path = ed.folder / f"{re.sub(r'[^A-Za-z0-9_.-]+', '_', tid or gname).strip('_')}.json"
-                if path.exists():
-                    raise ValueError(f"{path.name} already exists - pick it in 'Save into'")
-                game = Game(name=gname, title_id=tid, process=self.proc_name, path=path)
+                import game_ids  # noqa: PLC0415
+                run = self.run
+                same = run is not None and run.title_id == tid
+                ver = run.version if same else ""
+                path = game_ids.library_path(ed.folder, tid, ver, gname)
+                game = Game(name=gname, title_id=tid, version=ver, process=self.proc_name or "eboot.bin",
+                            path=path, content_id=run.content_id if same else "",
+                            author=ed.app.author() if hasattr(ed.app, "author") else "")
             else:
                 labels = [f"{g.name} [{g.title_id}]" for g in ed.games]
                 game = ed.games[labels.index(self.choice.get())]

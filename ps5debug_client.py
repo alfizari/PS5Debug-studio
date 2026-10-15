@@ -174,6 +174,15 @@ class ProcInfo:
 
 
 @dataclass
+class ForegroundApp:
+    pid: int
+    titleid: str
+    contentid: str
+    name: str
+    app_ver: str
+
+
+@dataclass
 class StackFrame:
     rbp: int
     rsp: int
@@ -469,15 +478,16 @@ class PS5DebugClient:
             self._send_packet(CMD_FW_VERSION)
             return struct.unpack("<H", self._recv(2))[0]
 
-    def foreground_app(self) -> tuple[int, str, str, str]:
-        """(pid, title id, name, app version) of the game in front; pid 0 = no game running."""
+    def foreground_app(self) -> "ForegroundApp":
+        """The game in front (ps5debug-NG 0xBDDD0006): pid (0 = none), title id, content id, process
+        name and app version (from the title's param.sfo / param.json)."""
         with self._txn("foreground app"):
             self._send_packet(0xBDDD0006)
             self._expect_success("foreground app")
             blob = self._recv(140)
-        pid, tid, _cid, name, ver = struct.unpack("<I16s64s40s16s", blob)
+        pid, tid, cid, name, ver = struct.unpack("<I16s64s40s16s", blob)
         dec = lambda b: b.split(b"\x00", 1)[0].decode("utf-8", "replace").strip()
-        return pid, dec(tid).upper(), dec(name), dec(ver)
+        return ForegroundApp(pid, dec(tid).upper(), dec(cid), dec(name), dec(ver))
 
     def list_processes(self) -> list[ProcessEntry]:
         with self._txn("proc list"):

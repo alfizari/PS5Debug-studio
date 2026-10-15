@@ -300,17 +300,21 @@ def analyze(game, cheat, fmt: str, items: Optional[dict] = None) -> Report:
 
 
 def check_game(game, fmt: str) -> tuple[list, list]:
-    """-> (errors, warnings) about the game header."""
+    """-> (errors, warnings) about the game header.  The same standard for every format (game_ids):
+    cheat menus find files by <TITLEID>_<VERSION>."""
+    import game_ids  # noqa: PLC0415
     errors, warnings = [], []
     tid = (game.title_id or "").strip().upper()
     ver = (game.version or "").strip()
-    if not TITLE_RE.match(tid):
-        errors.append(f"title id {tid or '(empty)'!r} must be CUSA##### or PPSA##### (cheat menus find the file by it)")
+    if not game_ids.TITLE_ID_FULL.fullmatch(tid):
+        errors.append(f"title id {tid or '(empty)'!r} must be CUSA##### or PPSA##### (cheat menus find the file by it)"
+                      " - press 'From console' with the game running")
     if not re.fullmatch(r"\d{2}\.\d{2,3}(\.\d{3})?", ver):
         errors.append(f"version {ver or '(empty)'!r} must be the game's app version, e.g. 01.05 (PS4) "
                       "or 01.000.000 (PS5)")
-    elif tid.startswith("CUSA") and not VERSION_RE.match(ver):
-        warnings.append(f"PS4 cheat files use versions like 01.05 - {ver!r} may not be found by the cheat menu")
+    elif not game_ids.version_ok(ver, tid):
+        warnings.append(f"{'PS4' if tid.startswith('CUSA') else 'PS5'} cheat files use versions like "
+                        f"{'01.05' if tid.startswith('CUSA') else '01.000.000'} - {ver!r} may not be found by the cheat menu")
     if not (game.name or "").strip():
         errors.append("the game needs a name")
     if not (game.process or "").strip():
