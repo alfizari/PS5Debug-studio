@@ -13,6 +13,9 @@ Rules (same as the files in the GoldHEN cheat repository and ReverseTelnet's AIO
   * .shn / .mc4 cheats are on/off (checkbox) only; .json also has "button" (run once)
   * title id CUSA##### / PPSA#####, version 01.05 (PS4) / 01.000.000 (PS5), file name TITLEID_VERSION.ext
   * .mc4 = the .shn text, PKCS#7 padded, AES-256-CBC with the public mc4 key, base64
+  * .ShnExt = raw-deflated JSON; every cheat is one encrypted "patch entry" whose lines are
+    fixed offsets from the executable with their code as assembly text (or nop:N).  The keys
+    live only in the private shnext_decryptor.py (not shipped); without it this format is off.
 """
 
 from __future__ import annotations
@@ -20,6 +23,8 @@ from __future__ import annotations
 import base64
 import json
 import re
+import sys
+import zlib
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 from xml.sax.saxutils import escape, quoteattr
@@ -32,7 +37,27 @@ FORMATS = {
     "shn": ("SHN cheat (.shn)", ".shn"),
     "mc4": ("MC4 cheat (.mc4, encrypted SHN)", ".mc4"),
     "json": ("GoldHEN cheat JSON (.json)", ".json"),
+    "shnext": ("ShnExt cheat (.ShnExt, encrypted)", ".ShnExt"),
 }
+
+
+def shnext_module():
+    """-> (module, "") or (None, why).  The private ShnExt module holds the keys; it is looked up
+    next to the tool and in cheat_player/ (and bundled into the exe when it is present at build)."""
+    try:
+        import shnext_decryptor as m            # noqa: PLC0415
+    except Exception:
+        try:
+            from app_paths import APP_DIR       # noqa: PLC0415
+            for d in (APP_DIR, APP_DIR / "cheat_player"):
+                if (d / "shnext_decryptor.py").exists() and str(d) not in sys.path:
+                    sys.path.append(str(d))
+            import shnext_decryptor as m        # noqa: PLC0415
+        except Exception as exc:
+            return None, f"the private ShnExt module (shnext_decryptor.py) is not available ({exc})"
+    if not all(hasattr(m, f) for f in ("encrypt_entry", "encrypt_process_name", "key_iv")):
+        return None, "shnext_decryptor.py is an older copy without the ShnExt writer - update it"
+    return m, ""
 TITLE_RE = re.compile(r"^(CUSA|PPSA)\d{5}$")
 VERSION_RE = re.compile(r"^\d{2}\.\d{2}$")
 MAIN_NAMES = ("", "main", "eboot.bin", "eboot", "executable")
@@ -165,8 +190,8 @@ def analyze(game, cheat, fmt: str) -> Report:
     if cheat.params:
         r.errors.append("has parameters (inputs) - .shn/.mc4/.json cheats cannot ask for a value")
     once = cheat.mode == "once"
-    if once and fmt != "json":
-        r.errors.append("is a run-once cheat - .shn/.mc4 only have on/off cheats (GoldHEN .json has buttons)")
+    if once and fmt not in ("json",):
+        r.errors.append("is a run-once cheat - .shn/.mc4/.ShnExt only have on/off cheats (GoldHEN .json has buttons)")
 
     def walk(steps: list, off_side: bool) -> list:
         out = []
@@ -212,6 +237,16 @@ def analyze(game, cheat, fmt: str) -> Report:
     offs = walk(list(cheat.off), True)
     if not cheat.steps:
         r.errors.append("has no steps")
+    if fmt == "shnext":
+        for sec, off, *_rest, what in ons + offs:
+            if sec != 0:
+                r.errors.append(f"{what}: " + ("an absolute address" if sec < 0 else f"section {sec}") +
+                                " - ShnExt lines are offsets from the start of the executable only")
+                break
+            if off >= 1 << 53:      # a JSON number: negative / huge offsets do not survive (read as double)
+                r.errors.append(f"{what}: offset 0x{off:X} is before the executable or too large for a "
+                                "ShnExt offset")
+                break
     used = set()
     for sec, off, data, op, expr, what in ons:
         data, button_off = data if isinstance(data, tuple) else (data, None)
@@ -351,6 +386,98 @@ def build_json(game, reports: list) -> str:
     return json.dumps(d, indent=2, ensure_ascii=False)
 
 
+# ------------------------------------------------------------------ ShnExt
+def _raw_deflate(data: bytes) -> bytes:
+    c = zlib.compressobj(6, zlib.DEFLATED, -15)
+    return c.compress(data) + c.flush()
+
+
+def asm_text(code: bytes, nop_ok: bool = True) -> str:
+    """Bytes -> ShnExt assembly text that assembles back to exactly these bytes wherever it is
+    assembled: "nop:N" for all-0x90, real instructions when they re-encode identically at two
+    different addresses, `.byte` for everything else (relative jumps/calls, odd encodings, data)."""
+    if not code:
+        raise ValueError("no bytes")
+    if nop_ok and code == b"\x90" * len(code):
+        return f"nop:{len(code)}"
+    import asmgen
+    import disasm
+    lines, pos = [], 0
+    insns = disasm.decode(code, 0, len(code)) if disasm.have_capstone() else []
+    for ins in insns:
+        if ins.addr != pos:
+            break
+        raw = bytes(code[pos:pos + ins.size])
+        text = ins.text
+        try:
+            ok = (asmgen.assemble(text, 0) == raw and asmgen.assemble(text, 0x7_0000_0000) == raw)
+        except Exception:
+            ok = False
+        lines.append(text if ok else ".byte " + ", ".join(f"0x{b:02X}" for b in raw))
+        pos += ins.size
+    if pos < len(code):
+        lines.append(".byte " + ", ".join(f"0x{b:02X}" for b in code[pos:]))
+    out = "\r\n".join(lines)
+    if asmgen.assemble(out, 0) != bytes(code):           # never write something that changes the bytes
+        out = ".byte " + ", ".join(f"0x{b:02X}" for b in code)
+    return out
+
+
+SHNEXT_MAX_LINE = 1024          # onionHEN's limit per line (ONION_MAX_PATCH_BYTES); longer lines are split
+
+
+def _split_line(on: bytes, off: bytes) -> list[tuple[int, bytes, bytes]]:
+    """[(relative offset, on, off)] pieces of at most SHNEXT_MAX_LINE bytes, cut at instruction
+    boundaries of the 'on' code where possible.  Written one after the other = the same bytes."""
+    n = max(len(on), len(off))
+    if n <= SHNEXT_MAX_LINE:
+        return [(0, on, off)]
+    cuts = []
+    try:
+        import disasm
+        cuts = [i.addr for i in disasm.decode(on, 0, len(on))] if disasm.have_capstone() else []
+    except Exception:
+        cuts = []
+    out, pos = [], 0
+    while pos < n:
+        end = min(n, pos + SHNEXT_MAX_LINE)
+        if end < n:
+            best = max((c for c in cuts if pos < c <= end), default=end)
+            end = best if best > pos else end
+        out.append((pos, on[pos:end], off[pos:end]))
+        pos = end
+    return out
+
+
+def build_shnext(game, reports: list) -> bytes:
+    m, why = shnext_module()
+    if m is None:
+        raise ValueError(why)
+    authors = [a.strip() for a in (game.author or "").split(",") if a.strip()]
+    entries = []
+    for i, r in enumerate(reports):
+        c = r.cheat
+        variables = []
+        for ln in r.lines:
+            for rel, on, off in _split_line(ln.on, ln.off):
+                variables.append({
+                    "index": 0, "defaultValue": asm_text(off) + "\r\n", "newValue": asm_text(on), "type": 11,
+                    "editor": None, "isAlwaysEnabled": False, "isStatic": True, "offsetFinder": None,
+                    "offsetFinderPtr": None, "option": None, "label": f"line{len(variables) + 1}",
+                    "DisplayName": None, "comment": None, "baseId": "0", "offset": ln.offset + rel})
+        patch = {"info": (c.description or "").replace("\n", "\r\n"), "name": c.name, "index": i,
+                 "author": getattr(c, "author", "") or (authors[0] if authors else ""),
+                 "isMasterCode": bool(re.search(r"master\s*code", c.name, re.IGNORECASE)),
+                 "isIgnored": False, "Variables": variables}
+        js = json.dumps(patch, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        entries.append(base64.b64encode(m.encrypt_entry(i, _raw_deflate(js))).decode("ascii"))
+    outer = {"Modder": authors, "patchEntries": entries, "dictionarys": [], "label": None,
+             "Comment": "", "ProcessName": m.encrypt_process_name(game.process or "eboot.bin"),
+             "Game": game.name, "Cusa": game.title_id.strip().upper(), "Version": game.version.strip(),
+             "Cover": None}
+    return _raw_deflate(json.dumps(outer, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+
 def build(fmt: str, game, reports: list) -> bytes:
     if fmt == "shn":
         return build_shn(game, reports).encode("utf-8")
@@ -358,6 +485,8 @@ def build(fmt: str, game, reports: list) -> bytes:
         return build_mc4(game, reports)
     if fmt == "json":
         return build_json(game, reports).encode("utf-8")
+    if fmt == "shnext":
+        return build_shnext(game, reports)
     raise ValueError(fmt)
 
 

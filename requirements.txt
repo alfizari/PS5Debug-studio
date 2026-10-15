@@ -1,3 +1,4 @@
 capstone
 keystone-engine
 numpy
+pycryptodome  # only used for ShnExt export (needs the private shnext_decryptor.py)

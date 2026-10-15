@@ -23,7 +23,7 @@ OWN = {
     "ps5c": ("Cheat pack for this tool (.ps5c) - keeps everything", ".ps5c"),
     "pack_json": ("Cheat JSON for this tool (.json) - keeps everything", ".json"),
 }
-ORDER = ("ps5c", "pack_json", "shn", "mc4", "json")
+ORDER = ("ps5c", "pack_json", "shn", "mc4", "json", "shnext")
 
 
 class ExportDialog:
@@ -45,12 +45,19 @@ class ExportDialog:
         ff = ttk.LabelFrame(top, text="File type", padding=6)
         ff.pack(fill="x")
         self.fmt = tk.StringVar(value=getattr(app, "_last_export_fmt", "ps5c"))
+        sx_mod, sx_why = ce.shnext_module()
+        if self.fmt.get() == "shnext" and sx_mod is None:
+            self.fmt.set("ps5c")
         for k in ORDER:
             label = OWN[k][0] if k in OWN else ce.FORMATS[k][0] + {
                 "shn": " - GoldHEN / etaHEN cheat menus (on/off patches)",
                 "mc4": " - same as .shn, encrypted",
-                "json": " - GoldHEN / etaHEN cheat menus (on/off + buttons)"}[k]
-            ttk.Radiobutton(ff, text=label, value=k, variable=self.fmt, command=self._changed).pack(anchor="w")
+                "json": " - GoldHEN / etaHEN cheat menus (on/off + buttons)",
+                "shnext": " - onionHEN / ShnExt (on/off patches of the executable)"}[k]
+            if k == "shnext" and sx_mod is None:
+                label += f"   [not available: {sx_why}]"
+            ttk.Radiobutton(ff, text=label, value=k, variable=self.fmt, command=self._changed,
+                            state="disabled" if (k == "shnext" and sx_mod is None) else "normal").pack(anchor="w")
 
         # ---- header (only used for the external formats; the game itself is not changed)
         self.hf = hf = ttk.LabelFrame(top, text="Written into the file (your game entry is not changed)", padding=6)
@@ -276,7 +283,12 @@ class ExportDialog:
             return
         if not path.lower().endswith(ext):
             path += ext                                  # never write mc4 bytes into a .shn etc.
-        Path(path).write_bytes(ce.build(fmt, hg, ok))
+        try:
+            data = ce.build(fmt, hg, ok)
+        except Exception as exc:
+            messagebox.showerror("Export", f"Could not build the {ext} file:\n\n{exc}", parent=self.win)
+            return
+        Path(path).write_bytes(data)
         want = ce.default_name(hg, fmt)
         note = "" if Path(path).name == want else f"  (cheat menus expect the name {want})"
         self.app.log_line(f"exported {len(ok)} cheat(s) of {g.name} as {ext} to {path}"

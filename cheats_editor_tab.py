@@ -626,6 +626,21 @@ class CheatsEditorTab:
         self._put_cheat(d, cheat_tools.add_steps(d, [step]))
         return True
 
+    def insert_steps(self, steps: list, params: list = ()) -> bool:
+        """Add several steps (and the inputs they use) to the open cheat in one edit."""
+        d = self._need_cheat()
+        if d is None:
+            return False
+        have = {p.get("name") for p in d.get("params", []) if isinstance(p, dict)}
+        new = [p for p in params if p.get("name") not in have]
+        if new:
+            d.setdefault("params", []).extend(new)
+        log = cheat_tools.add_steps(d, list(steps))
+        if new:
+            log.append("added input(s) " + ", ".join("$" + p["name"] for p in new))
+        self._put_cheat(d, log)
+        return True
+
     def on_check_fix(self) -> None:
         """Find @buffers used before a step creates them and add the missing alloc /
         code steps from this session's buffers (with their current contents)."""

@@ -10,6 +10,7 @@ the dialog and a saved cheat behave identically.
 from __future__ import annotations
 
 import re
+import struct
 import tkinter as tk
 from dataclasses import dataclass, field
 from tkinter import messagebox, ttk
@@ -33,13 +34,193 @@ class HookState:
     enabled: bool = False
     cave: int = 0
     undo: list = field(default_factory=list)
+    inputs: dict = field(default_factory=dict)      # name -> {"type", "value", "size"} from the dialog
+
+
+INPUT_TYPES = ("u64", "u32", "u16", "u8", "i64", "i32", "f32", "f64")
+BUFFER_TYPES = ("u64", "u32", "u16", "u8", "i32", "f32", "f64", "hex", "utf8")
+_AT_RE = re.compile(r"@([A-Za-z_]\w*)")
+
+
+def at_names(code: str) -> list[str]:
+    """@buffers used by the assembly (comments ignored)."""
+    seen: list[str] = []
+    for line in code.split("\n"):
+        for n in _AT_RE.findall(line.split(";", 1)[0]):
+            if n not in seen:
+                seen.append(n)
+    return seen
+
+
+def _int_value(typ: str, text: str) -> int:
+    v = int(str(text).strip() or "0", 0)
+    bits = 8 * {"u8": 1, "u16": 2, "u32": 4, "i32": 4}.get(typ, 8)
+    if not -(1 << (bits - 1)) <= v < (1 << bits):
+        raise ValueError(f"{text} does not fit in {typ}")
+    return v & ((1 << bits) - 1)
+
+
+class InputsPanel:
+    """Every $input and @buffer the cave code uses, with a type and a default value - like the
+    Variables row of the Caller's assembler.  $inputs: the value used when you enable the hook here,
+    and the input's default when you save a cheat (f32/f64 go into the code as their IEEE bits).
+    @buffers: a session buffer of that name is used as it is; otherwise one is created next to the
+    hook (size + start value).  A saved cheat always gets an alloc step, so it works on its own."""
+
+    def __init__(self, parent, dialog: "CodeCaveDialog", saved: dict) -> None:
+        self.d = dialog
+        self.state: dict[str, dict] = {k: dict(v) for k, v in (saved or {}).items()}
+        self.frame = ttk.LabelFrame(parent, text="Inputs ($name) and buffers (@name) used by the code")
+        self.grid = ttk.Frame(self.frame, padding=(6, 2))
+        self.grid.pack(fill="x")
+        self.names: tuple = ()
+        self._job = None
+
+    # -- names in the code ----------------------------------------------------
+    def scan(self) -> tuple[list[str], list[str]]:
+        code = self.d._asm_text()
+        hook = self.d.name_var.get().strip()
+        return codecave.dollar_vars(code), [n for n in at_names(code) if n != hook]
+
+    def schedule(self, _e=None) -> None:
+        if self._job:
+            self.d.win.after_cancel(self._job)
+        self._job = self.d.win.after(400, self.rebuild)
+
+    def _var(self, name: str, key: str, default: str) -> tk.StringVar:
+        st = self.state.setdefault(name, {})
+        v = tk.StringVar(value=str(st.get(key, default)))
+        v.trace_add("write", lambda *_a, n=name, k=key, var=v: self.state[n].__setitem__(k, var.get()))
+        st.setdefault(key, default)
+        return v
+
+    def rebuild(self) -> None:
+        self._job = None
+        dollars, ats = self.scan()
+        key = (tuple(dollars), tuple(ats), tuple(b.name for b in self.d.app.state.buffers))
+        if key == self.names:
+            return
+        self.names = key
+        for w in self.grid.winfo_children():
+            w.destroy()
+        if not dollars and not ats:
+            ttk.Label(self.grid, foreground=theme.c("muted"),
+                      text="None yet - write $value or @buf0 in the code and they appear here with a "
+                           "type and default value.").grid(row=0, column=0, sticky="w")
+            return
+        r = 0
+        for n in dollars:
+            ttk.Label(self.grid, text="$" + n, font=("Consolas", 10, "bold")).grid(row=r, column=0, sticky="w")
+            ttk.Combobox(self.grid, textvariable=self._var("$" + n, "type", "u64"), values=INPUT_TYPES,
+                         width=5, state="readonly").grid(row=r, column=1, padx=4, pady=1)
+            ttk.Label(self.grid, text="default").grid(row=r, column=2, sticky="e")
+            ttk.Entry(self.grid, textvariable=self._var("$" + n, "value", "0"), width=16).grid(
+                row=r, column=3, sticky="w", padx=4)
+            ttk.Label(self.grid, foreground=theme.c("muted"),
+                      text="input - f32/f64 go into the code as float bits").grid(row=r, column=4, columnspan=3,
+                                                                                 sticky="w")
+            r += 1
+        for n in ats:
+            buf = next((b for b in self.d.app.state.buffers if b.name == n), None)
+            ttk.Label(self.grid, text="@" + n, font=("Consolas", 10, "bold")).grid(row=r, column=0, sticky="w")
+            ttk.Combobox(self.grid, textvariable=self._var("@" + n, "type", "u64"), values=BUFFER_TYPES,
+                         width=5, state="readonly").grid(row=r, column=1, padx=4, pady=1)
+            ttk.Label(self.grid, text="start value").grid(row=r, column=2, sticky="e")
+            ttk.Entry(self.grid, textvariable=self._var("@" + n, "value", "0"), width=16).grid(
+                row=r, column=3, sticky="w", padx=4)
+            ttk.Label(self.grid, text="size").grid(row=r, column=4, sticky="e")
+            ttk.Entry(self.grid, textvariable=self._var("@" + n, "size", "16"), width=6).grid(
+                row=r, column=5, sticky="w", padx=4)
+            ttk.Label(self.grid, foreground=theme.c("muted"),
+                      text=(f"session buffer 0x{buf.address:X} is used as it is" if buf
+                            else "created when you enable (next to the hook if used as [rip:@name])")).grid(row=r, column=6, sticky="w")
+            r += 1
+
+    # -- values ---------------------------------------------------------------
+    def inputs(self) -> list[tuple[str, str, str]]:
+        """[(name, type, value text)] for the $inputs in the code"""
+        dollars, _ = self.scan()
+        out = []
+        for n in dollars:
+            st = self.state.get("$" + n, {})
+            out.append((n, st.get("type", "u64"), str(st.get("value", "0"))))
+        return out
+
+    def buffers(self) -> list[tuple[str, str, str, int]]:
+        """[(name, type, start value, size)] for the @buffers in the code"""
+        _, ats = self.scan()
+        out = []
+        for n in ats:
+            st = self.state.get("@" + n, {})
+            try:
+                size = int(str(st.get("size", "16")).strip() or "16", 0)
+            except ValueError:
+                raise ValueError(f"@{n}: size '{st.get('size')}' is not a number") from None
+            if not 1 <= size <= 0x100000:
+                raise ValueError(f"@{n}: size must be 1 .. 0x100000")
+            out.append((n, st.get("type", "u64"), str(st.get("value", "0")), size))
+        return out
+
+    def check(self) -> None:
+        """Raises ValueError for a default that does not parse."""
+        for n, typ, text in self.inputs():
+            try:
+                float(text) if typ in ("f32", "f64") else _int_value(typ, text)
+            except ValueError as exc:
+                raise ValueError(f"${n}: {exc}") from None
+        self.buffers()
+
+    def apply(self, rt) -> None:
+        """Put the $input defaults into a Runtime (same as a cheat's inputs)."""
+        for n, typ, text in self.inputs():
+            if typ in ("f32", "f64"):
+                v = float(text)
+                rt.fparams[n], rt.ftypes[n] = v, typ
+                rt.vars[n] = int(v) & 0xFFFFFFFFFFFFFFFF
+            else:
+                rt.vars[n] = _int_value(typ, text)
+
+    def params(self) -> list[dict]:
+        return [{"name": n, "label": n.replace("_", " ").title(), "type": typ, "default": text}
+                for n, typ, text in self.inputs()]
+
+    def alloc_steps(self, near: str, only_missing: bool) -> list[dict]:
+        steps = []
+        for n, typ, text, size in self.buffers():
+            if only_missing and any(b.name == n for b in self.d.app.state.buffers):
+                continue
+            st = {"op": "alloc", "name": n, "size": size, "prot": "rw"}
+            if re.search(r"\[rip:[^\]]*@" + re.escape(n) + r"\b", self.d._asm_text()):
+                st["near"] = near                     # RIP-relative use: must be within 2 GB of the code
+            if str(text).strip():
+                st["init"] = {"type": typ, "value": text}
+            steps.append(st)
+        return steps
+
+    def preview_ev(self, expr: str) -> int:
+        """Resolver for the preview: inputs use their defaults, missing buffers a stand-in address."""
+        e = str(expr).strip()
+        m = re.fullmatch(r"\$([A-Za-z_]\w*)", e)
+        if m:
+            for n, typ, text in self.inputs():
+                if n == m.group(1):
+                    if typ == "f32":
+                        return struct.unpack("<I", struct.pack("<f", float(text)))[0]
+                    if typ == "f64":
+                        return struct.unpack("<Q", struct.pack("<d", float(text)))[0]
+                    return _int_value(typ, text)
+        m = re.fullmatch(r"@([A-Za-z_]\w*)", e)
+        if m and not any(b.name == m.group(1) for b in self.d.app.state.buffers):
+            return self.d.addr + 0x100000           # not created yet: preview as if it were next to the hook
+        return self.d.app.eval_full(e)
 
 
 class CodeCaveDialog:
     HELP = (
         "Left: what the game runs at the hook address today.  Edit it or add lines - this code runs INSTEAD, then the "
         "game continues after the replaced instructions (a jump back is appended for you).\n"
-        "Expressions work as in cheats: @buf0   $input   module(eboot.bin)+0x10   {expr}.   "
+        "Expressions work as in cheats: @buf0   $input   module(eboot.bin)+0x10   {expr} - every $input / @buffer "
+        "you use gets a type and default value in the panel above.   "
         "[rip:EXPR] = RIP-relative operand to an absolute address (written for you, stays ASLR-safe).\n"
         "Registers/flags you change here are visible to the game afterwards - save and restore what you use "
         "(push/pop) unless you mean to change it."
@@ -96,6 +277,8 @@ class CodeCaveDialog:
         ttk.Label(win, text=self.HELP, wraplength=860, justify="left", foreground=theme.c("muted"),
                   padding=(8, 0, 8, 4)).pack(anchor="w")
 
+        self.inputs = InputsPanel(win, self, self.hs.inputs if self.hs else {})
+        self.inputs.frame.pack(fill="x", padx=8, pady=(0, 4))
         mid = ttk.Panedwindow(win, orient="vertical")
         mid.pack(fill="both", expand=True, padx=8, pady=4)
         af = ttk.LabelFrame(mid, text="Cave code (x86-64)")
@@ -103,6 +286,7 @@ class CodeCaveDialog:
         mid.add(af, weight=3)
         mid.add(of, weight=2)
         self.asm = tk.Text(af, wrap="none", font=("Consolas", 11), undo=True, height=12)
+        self.asm.bind("<KeyRelease>", self.inputs.schedule, add="+")
         ys = ttk.Scrollbar(af, orient="vertical", command=self.asm.yview)
         self.asm.configure(yscrollcommand=ys.set)
         self.asm.pack(side="left", fill="both", expand=True)
@@ -136,6 +320,7 @@ class CodeCaveDialog:
         else:
             self._recheck(first=True)
         self._update_status()
+        self.inputs.rebuild()
         self.on_preview(quiet=True)
 
     # --------------------------------------------------------------- state
@@ -225,7 +410,8 @@ class CodeCaveDialog:
             return
         base = self.hs.cave if (self.hs and self.hs.cave) else self.addr
         try:
-            code = codecave.assemble_cave(self._asm_text(), base, self.app.eval_full, self.addr + len(self.orig))
+            self.inputs.rebuild()
+            code = codecave.assemble_cave(self._asm_text(), base, self.inputs.preview_ev, self.addr + len(self.orig))
         except Exception as exc:
             self._write_out(str(exc), error=True)
             return
@@ -256,6 +442,8 @@ class CodeCaveDialog:
         try:
             pid = app._pid()
             step = self._step()
+            self.inputs.check()
+            allocs = self.inputs.alloc_steps(f"0x{self.addr:X}", only_missing=True)
         except Exception as exc:
             messagebox.showerror("Code cave", str(exc), parent=self.win)
             return
@@ -268,6 +456,7 @@ class CodeCaveDialog:
         if not hs.enabled:
             hs.orig = self.orig
         hs.far, hs.asm, hs.name = self.far.get(), self._asm_text(), step["name"]
+        hs.inputs = self.inputs.state
         step["orig"] = hs.orig.hex(" ").upper()
         root = app.root
 
@@ -276,7 +465,8 @@ class CodeCaveDialog:
 
         def work() -> None:
             rt = Runtime(app.client, app.state, pid, app.make_cheat_buffer, log, hs.undo)
-            rt.run([step])
+            self.inputs.apply(rt)
+            rt.run(allocs + [step])
             hs.enabled = True
             hs.cave = next((b.address for b in app.state.buffers if b.name == hs.name), 0)
             root.after(0, self._after_change)
@@ -318,16 +508,19 @@ class CodeCaveDialog:
         self.warn_var.set("")
 
     def _with_steps(self, then) -> None:
-        """then(list_of_steps) on the UI thread; with 'Locate by AOB' an `aob` step that finds the
-        site by a unique signature comes first and the hook uses "$<name>_site"."""
+        """then(list_of_steps, params) on the UI thread; with 'Locate by AOB' an `aob` step that finds
+        the site by a unique signature comes first and the hook uses "$<name>_site".  @buffers get an
+        alloc step next to the hook, $inputs become the cheat's inputs (with the defaults set here)."""
         try:
             step = self._step()
+            self.inputs.check()
+            params = self.inputs.params()
             pid = self.app._pid() if self.use_aob.get() else 0
         except Exception as exc:
             messagebox.showerror("Code cave", str(exc), parent=self.win)
             return
         if not self.use_aob.get():
-            then([step])
+            then(self.inputs.alloc_steps(step["addr"], only_missing=False) + [step], params)
             return
         app = self.app
         import aob as aobmod
@@ -341,15 +534,14 @@ class CodeCaveDialog:
             var = re.sub(r"\W", "_", step["name"]) + "_site"
             find = {"op": "aob", "pattern": text, "store": var}
             hook = dict(step, addr=f"${var}")
-            app.root.after(0, lambda: then([find, hook]))
+            allocs = self.inputs.alloc_steps(f"${var}", only_missing=False)
+            app.root.after(0, lambda: then([find] + allocs + [hook], params))
 
         app._run_bg(work, "Building AOB signature...")
 
     def on_insert_step(self) -> None:
-        def done(steps: list) -> None:
-            ok = True
-            for st in steps:
-                ok = ok and self.app.cheats_editor.insert_step(st)
+        def done(steps: list, params: list) -> None:
+            ok = self.app.cheats_editor.insert_steps(steps, params)
             if ok:
                 self.app.notebook.select(self.app._cheats_editor_tab)
                 self.app.log_line(f"inserted {len(steps)} step(s) for hook '{steps[-1]['name']}' into the Cheat Editor")
@@ -358,7 +550,7 @@ class CodeCaveDialog:
     def on_save_cheat(self) -> None:
         self._with_steps(self._save_cheat)
 
-    def _save_cheat(self, steps: list) -> None:
+    def _save_cheat(self, steps: list, params: list) -> None:
         try:
             pid = self.app._pid()
         except Exception as exc:
@@ -374,7 +566,7 @@ class CodeCaveDialog:
                 tid, pname = info.titleid.strip().upper(), info.name
             except Exception:
                 pass
-            app.root.after(0, lambda: SaveCheatDialog(self, step, tid, pname))
+            app.root.after(0, lambda: SaveCheatDialog(self, step, tid, pname, params))
 
         app._run_bg(work, "Reading title id...")
 
@@ -382,8 +574,10 @@ class CodeCaveDialog:
 class SaveCheatDialog:
     NEW = "(new game file)"
 
-    def __init__(self, cave: CodeCaveDialog, step: dict, title_id: str, proc_name: str) -> None:
+    def __init__(self, cave: CodeCaveDialog, step: dict, title_id: str, proc_name: str,
+                 params: Optional[list] = None) -> None:
         self.cave, self.proc_name = cave, proc_name
+        self.params = list(params or [])
         self.steps = step if isinstance(step, list) else [step]
         self.step = self.steps[-1]
         self.ed = cave.app.cheats_editor
@@ -391,7 +585,7 @@ class SaveCheatDialog:
         self.win = win
         win.title("Save code cave as cheat")
         win.transient(cave.win)
-        fit_geometry(win, 520, 330)
+        fit_geometry(win, 560, 400)
         bt = ttk.Frame(win, padding=(10, 0, 10, 10))
         bt.pack(side="bottom", fill="x")             # first, so Save is never cut off
         ttk.Button(bt, text="Save cheat", style="Accent.TButton", command=self.on_save).pack(side="left")
@@ -427,11 +621,16 @@ class SaveCheatDialog:
         ttk.Entry(f, textvariable=self.gname, width=44).grid(row=4, column=1, sticky="we")
         ttk.Label(f, text="Title ID").grid(row=5, column=0, sticky="w", pady=2)
         ttk.Entry(f, textvariable=self.tid, width=20).grid(row=5, column=1, sticky="w")
-        vars_ = codecave.dollar_vars(str(self.step.get("asm", "")))   # `step` may be [aob, hook]
-        if vars_:
-            ttk.Label(f, foreground=theme.c("muted"), wraplength=480,
-                      text="$" + ", $".join(vars_) + " in the code become inputs on the Cheats tab (u64, default 0).").grid(
-                row=6, column=0, columnspan=2, sticky="w", pady=6)
+        bufs = [st["name"] for st in self.steps if st.get("op") == "alloc"]
+        notes = []
+        if self.params:
+            notes.append("Inputs on the Cheats tab: " + ", ".join(
+                f"${p['name']} ({p['type']}, default {p['default']})" for p in self.params))
+        if bufs:
+            notes.append("Buffers created next to the hook: " + ", ".join("@" + b for b in bufs))
+        if notes:
+            ttk.Label(f, foreground=theme.c("muted"), wraplength=480, justify="left",
+                      text="\n".join(notes)).grid(row=6, column=0, columnspan=2, sticky="w", pady=6)
         f.columnconfigure(1, weight=1)
 
     def on_save(self) -> None:
@@ -440,8 +639,7 @@ class SaveCheatDialog:
             messagebox.showerror("Cheats", "Give the cheat a name", parent=self.win)
             return
         ed = self.ed
-        params = [{"name": v, "label": v.replace("_", " ").title(), "type": "u64", "default": "0"}
-                  for v in codecave.dollar_vars(self.step["asm"])]
+        params = self.params
         try:
             if self.choice.get() == self.NEW:
                 tid = self.tid.get().strip().upper()

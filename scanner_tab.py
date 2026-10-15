@@ -29,6 +29,7 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import Callable, Optional
 
 import theme
+from scrollable import ScrollFrame
 from ps5debug_client import (
     PS5DebugClient, ProtocolError, TurboCaps, TurboScanSession,
     TS_FLOAT_EXACT, TS_FLOAT_SIMPLE, TS_RESCAN_ALIASING, TS_USE_ALIASING,
@@ -164,6 +165,10 @@ class ScannerTab:
         self.scan_pid = 0
         self.scanning = False
         self.scan_no = 0
+        self.scan_align = 1
+        # undo: after each scan the result addresses are kept here (small scans only, so scanning
+        # stays fast); going back re-reads just those addresses on the console
+        self.history: list[dict] = []
         self.page = 0
         self.rows: list = []            # ScanResult for the current page
         self.entries: list[Entry] = []
@@ -218,9 +223,12 @@ class ScannerTab:
         self.res.bind("<Button-3>", self._res_menu)
         self.res.bind("<Control-c>", lambda _e: self._copy_res_addr())
 
-        # ---- controls (right)
-        right = ttk.Frame(top, padding=(12, 0, 0, 0))
-        right.pack(side="right", fill="y")
+        # ---- controls (right) - scrolls when the window is too short for all the options
+        rs = ScrollFrame(top, horizontal=False)
+        rs.pack(side="right", fill="y", padx=(12, 0))
+        right = rs.body
+        right.bind("<Configure>", lambda _e: rs.canvas.configure(width=right.winfo_reqwidth()), add="+")
+        self._ctl_scroll = rs
 
         btns = ttk.Frame(right)
         btns.pack(fill="x")
@@ -229,6 +237,15 @@ class ScannerTab:
         self.next_btn = ttk.Button(btns, text="Next Scan", command=self.on_next, state="disabled")
         self.next_btn.pack(side="left", fill="x", expand=True, padx=(6, 0))
         self.cancel_btn = ttk.Button(right, text="Cancel scan", style="Danger.TButton", command=self.on_cancel)
+        hrow = ttk.Frame(right)
+        hrow.pack(fill="x", pady=(6, 0))
+        self.undo_btn = ttk.Button(hrow, text="↶ Undo scan", style="Small.TButton", command=self.on_undo,
+                                   state="disabled")
+        self.undo_btn.pack(side="left")
+        self.hist_var = tk.StringVar(value="")
+        self.hist_cb = ttk.Combobox(hrow, textvariable=self.hist_var, state="disabled", width=26)
+        self.hist_cb.pack(side="left", fill="x", expand=True, padx=(6, 0))
+        self.hist_cb.bind("<<ComboboxSelected>>", lambda _e: self.on_history_pick())
         self.progress = ttk.Progressbar(right, mode="determinate", maximum=1000)
         self.progress.pack(fill="x", pady=(8, 2))
         self.status_var = tk.StringVar(value="Pick a process, type a value, press First Scan.")
@@ -448,6 +465,7 @@ class ScannerTab:
             self.next_btn.configure(state="normal" if self._can_next() else "disabled")
             self.vtype_cb.configure(state="disabled" if self._can_next() else "readonly")
             self._sync_scan_types()
+        self._sync_history()
 
     def _progress(self, phase: str, done: int, total: int) -> None:
         def ui() -> None:
@@ -514,6 +532,7 @@ class ScannerTab:
         if self.session:
             self.session.active = False
         self.session = None
+        self.history = []
         self._post(lambda: (self._set_busy(False), self._show_page([])))
 
     # -------------------------------------------------------------- regions
@@ -614,6 +633,9 @@ class ScannerTab:
                                         on_progress=self._progress, keep_first=True,
                                         include_zeros=self.zeros_var.get())
             self.scan_no = 1
+            self.scan_align = align
+            self.history = []
+            self._record(n)
             dt = time.monotonic() - t0
             mb = sum(s for _a, s in segs) / 1048576
             self._after_scan(n, f"First scan: {n:,} result(s) in {dt:.1f}s · {mb:,.0f} MB in {len(segs)} region(s)")
@@ -635,6 +657,7 @@ class ScannerTab:
             t0 = time.monotonic()
             n = self.session.next_scan(code, value, mask, self._flags(False), on_progress=self._progress)
             self.scan_no += 1
+            self._record(n)
             self._after_scan(n, f"Scan {self.scan_no}: {n:,} result(s) in {time.monotonic() - t0:.1f}s")
 
         self._run(work, "Next scan…")
@@ -647,6 +670,7 @@ class ScannerTab:
             if self.session:
                 self.session.active = False
             self.scan_no = 0
+            self.history = []
             self._post(lambda: (self._show_page([]), self.status_var.set("New scan: pick the options, then First Scan."),
                                 self.found_var.set("Found: 0")))
 
@@ -677,6 +701,94 @@ class ScannerTab:
                 self._post(lambda: self._set_busy(False))
 
         threading.Thread(target=wrapper, daemon=True, name="scanner-scan").start()
+
+    # -------------------------------------------------------------- undo
+    HIST_MAX = 1_000_000            # results kept per step (8 bytes each); bigger steps cannot be undone to
+
+    def _record(self, n: int) -> None:
+        """Remember this step's result addresses (scan thread)."""
+        s = self.session
+        entry = {"no": self.scan_no, "count": n, "addrs": None, "why": ""}
+        if s.value_len > 8:
+            entry["why"] = "byte arrays / text cannot be restored"
+        elif n > self.HIST_MAX:
+            entry["why"] = f"over {self.HIST_MAX:,} results"
+        else:
+            parts, start = [], 0
+            while start < n:
+                blob, got, rec = s.get_raw(start, min(262144, n - start))
+                if not got:
+                    break
+                parts.append(b"".join(blob[i:i + 8] for i in range(0, got * rec, rec)))
+                start += got
+            entry["addrs"] = b"".join(parts)
+        self.history.append(entry)
+
+    @staticmethod
+    def _hist_label(e: dict) -> str:
+        return f"Scan {e['no']}: {e['count']:,} result(s)" + ("" if e["addrs"] is not None else f"  (no undo: {e['why']})")
+
+    def _sync_history(self) -> None:
+        h = self.history
+        self.hist_cb.configure(values=[self._hist_label(e) for e in h],
+                               state="readonly" if len(h) > 1 and not self.scanning else "disabled")
+        self.hist_var.set(self._hist_label(h[-1]) if h else "")
+        can = (not self.scanning and len(h) > 1 and h[-2]["addrs"] is not None
+               and self.session is not None and self.session.active)
+        self.undo_btn.configure(state="normal" if can else "disabled")
+
+    def on_undo(self) -> None:
+        if len(self.history) > 1:
+            self._revert(len(self.history) - 2)
+
+    def on_history_pick(self) -> None:
+        labels = [self._hist_label(e) for e in self.history]
+        try:
+            k = labels.index(self.hist_var.get())
+        except ValueError:
+            return
+        if k == len(self.history) - 1:
+            return
+        self._revert(k)
+
+    def _revert(self, k: int) -> None:
+        if self.scanning or not self.session or not self.session.active:
+            return
+        e = self.history[k]
+        if e["addrs"] is None:
+            messagebox.showinfo("Scanner", f"Scan {e['no']} cannot be restored ({e['why']}).")
+            self._sync_history()
+            return
+        spec, pid, align = self.scan_spec, self.scan_pid, max(1, self.scan_align)
+        flags = self._flags(True) & ~TS_FLOAT_SIMPLE        # keep every saved address
+
+        def work() -> None:
+            addrs = sorted(set(struct.unpack(f"<{len(e['addrs']) // 8}Q", e["addrs"])))
+            vl = self.session.value_len
+            segs: list[list[int]] = []
+            for a in addrs:                 # runs spaced by the scan alignment become one segment
+                if segs and a - segs[-1][2] == align and segs[-1][1] + align <= 0xFFFF0000:
+                    segs[-1][1] += align
+                    segs[-1][2] = a
+                else:
+                    segs.append([a, vl, a])
+            if len(segs) > (1 << 20):
+                raise ProtocolError("too many separate addresses to restore this scan")
+            if not segs:
+                raise ProtocolError("that scan had no results")
+            if self.session.active:
+                self.session.end()
+            n = self.session.first_scan(pid, [(a, ln) for a, ln, _l in segs], spec.tid, 11, b"", None, align, flags,
+                                        on_progress=self._progress, keep_first=True, include_zeros=True)
+            self.scan_no = e["no"]
+            del self.history[k + 1:]
+            e["count"] = n
+            gone = len(addrs) - n
+            self._after_scan(n, f"Back to scan {e['no']}: {n:,} result(s)"
+                             + (f" ({gone:,} no longer readable)" if gone > 0 else "")
+                             + ".  Values re-read now; 'Previous' = the value at the undo.")
+
+        self._run(work, f"Going back to scan {e['no']}…")
 
     def on_cancel(self) -> None:
         pid = self.scan_pid

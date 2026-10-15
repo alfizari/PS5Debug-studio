@@ -12,8 +12,9 @@ REM  The exe keeps its settings.json, cheats\ (default project), tables\,
 REM  scripts\ and pointerscans\ next to itself.  On the first build your
 REM  current ones are copied there; later builds never overwrite them.
 REM
-REM  Private: the ShnExt decryptor (cheat_player\shnext_decryptor.py) is NOT
-REM  included in this exe.
+REM  ShnExt export: when the private cheat_player\shnext_decryptor.py is on this
+REM  PC it is built INTO the exe (so the exe can write .ShnExt files).  It is
+REM  never in the GitHub repo; without it the exe builds fine, ShnExt export off.
 REM ==========================================================================
 setlocal EnableDelayedExpansion
 cd /d "%~dp0"
@@ -48,7 +49,7 @@ if errorlevel 1 (
 
 REM ---- packages (quick when they are already installed) ---------------------
 echo Checking packages...
-python -m pip install --disable-pip-version-check -q --upgrade pyinstaller capstone keystone-engine numpy
+python -m pip install --disable-pip-version-check -q --upgrade pyinstaller capstone keystone-engine numpy pycryptodome
 if errorlevel 1 (
   echo pip could not install the packages - check your internet connection.
   goto fail
@@ -58,6 +59,15 @@ REM ---- every module of the tool (also the ones loaded only when a window opens
 set "HIDDEN="
 for %%F in (*.py) do (
   if /I not "%%~nF"=="gui" set "HIDDEN=!HIDDEN! --hidden-import %%~nF"
+)
+
+REM ---- private ShnExt module (keys): included only when it is here --------------
+set "SHNEXT=--exclude-module shnext_decryptor"
+if exist "cheat_player\shnext_decryptor.py" (
+  echo Including the private ShnExt module - ShnExt export will work in the exe.
+  set "SHNEXT=--paths cheat_player --hidden-import shnext_decryptor --hidden-import Crypto.Cipher.AES"
+) else (
+  echo cheat_player\shnext_decryptor.py not found - building without ShnExt export.
 )
 
 REM ---- close a running copy, or the exe cannot be replaced -----------------
@@ -78,7 +88,7 @@ python -m PyInstaller --noconfirm --clean %MODE% --windowed --name "%NAME%" ^
   !HIDDEN! ^
   --collect-all capstone --collect-all keystone ^
   --hidden-import numpy ^
-  --exclude-module shnext_decryptor --exclude-module shnext_bridge --exclude-module player ^
+  !SHNEXT! --exclude-module shnext_bridge --exclude-module player ^
   --exclude-module unicorn --exclude-module matplotlib --exclude-module pandas ^
   --exclude-module scipy --exclude-module PyQt5 --exclude-module PySide6 --exclude-module IPython ^
   gui.py

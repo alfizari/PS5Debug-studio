@@ -244,9 +244,10 @@ def _reap_cheat(p: dict, notes: list[str]) -> dict:
     addrs = {k: v for k, v in vars_.items() if v.get("type") == 6}
     # code at a fixed offset from the executable (no AOB): baseId "0" + offset, e.g.
     # {"label":"healthSource","baseId":"0","offset":31563972,"newValue":"nop:6","defaultValue":"mov ..."}
+    # (code-cave blocks have baseId "" and isStatic false; fixed patches are marked isStatic)
     statics = {k: v for k, v in vars_.items() if v.get("type") == 11 and not v.get("offsetFinder")
-               and str(v.get("baseId") or "0") == "0" and int(v.get("offset") or 0) > 0
-               and str(v.get("newValue") or "").strip()}
+               and (v.get("isStatic") is True or (str(v.get("baseId") or "") == "0" and int(v.get("offset") or 0) > 0))
+               and str(v.get("baseId") or "0") == "0" and str(v.get("newValue") or "").strip()}
     codes = {k: v for k, v in vars_.items() if v.get("type") == 11 and not v.get("offsetFinder")
              and not v.get("baseId") and k not in statics}
     sites = {k: v for k, v in vars_.items() if v.get("type") == 11 and not v.get("offsetFinder")
@@ -391,7 +392,7 @@ def _reap_cheat(p: dict, notes: list[str]) -> dict:
         cheat["description"] = str(p["info"]).replace("\r", "")
     if p.get("author"):
         cheat["author"] = str(p["author"])
-    if p.get("isMasterCode"):
+    if p.get("isMasterCode") and not re.search(r"master\s*code", name, re.IGNORECASE):
         cheat["name"] = f"{name} (master code)"
     return cheat
 

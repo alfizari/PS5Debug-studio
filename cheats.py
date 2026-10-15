@@ -360,6 +360,7 @@ class Runtime:
         self.fparams: dict[str, float] = {}
         self.strs: dict[str, str] = {}      # string params, used as {name} in text
         self.turning_off = False
+        self.ftypes: dict[str, str] = {}    # float param -> "f32" / "f64" (its bits go into assembly)
         self._maps = None
 
     # -- helpers ---------------------------------------------------------
@@ -369,6 +370,17 @@ class Runtime:
         if isinstance(value, int):
             return value & M64
         return _Parser(self, str(value)).parse()
+
+    def asm_ev(self, expr: str) -> int:
+        """Like ev(), for names inside assembly: a float input ($speed with type f32/f64) becomes its
+        IEEE bits, so `mov eax, $speed` loads the float.  Everything else is the same as ev()."""
+        m = re.fullmatch(r"\s*\$([A-Za-z_]\w*)\s*", str(expr))
+        if m and m.group(1) in self.fparams:
+            v = self.fparams[m.group(1)]
+            if self.ftypes.get(m.group(1), "f32") == "f64":
+                return struct.unpack("<Q", struct.pack("<d", v))[0]
+            return struct.unpack("<I", struct.pack("<f", v))[0]
+        return self.ev(expr)
 
     def template(self, text: str) -> str:
         """Replace {name} with the string param of that name (others left as-is)."""
@@ -527,7 +539,7 @@ class Runtime:
             align = int(s.get("align", 16))
             auto_ret = bool(s.get("auto_ret", True))
             try:
-                resolved = asmgen.substitute(code, self.ev)
+                resolved = asmgen.substitute(code, self.asm_ev)
                 if s.get("auto_frame", True):
                     resolved, frame = asmgen.auto_frame(resolved)
                     if frame:
@@ -575,7 +587,7 @@ class Runtime:
             # original bytes are restored when a toggle cheat is turned off
             addr = self.ev(s["addr"])
             try:
-                code = asmgen.substitute(str(s["asm"]), self.ev)
+                code = asmgen.substitute(str(s["asm"]), self.asm_ev)
                 data = asmgen.assemble(code, addr)
             except asmgen.AsmError as exc:
                 raise CheatError(str(exc)) from exc
@@ -818,7 +830,7 @@ class Runtime:
                 "(different game version, a breakpoint, or another patch is there)")
 
         try:
-            probe = codecave.assemble_cave(asm, addr, self.ev, resume)   # only to learn the size
+            probe = codecave.assemble_cave(asm, addr, self.asm_ev, resume)   # only to learn the size
         except asmgen.AsmError as exc:
             raise CheatError(str(exc)) from exc
         size = ((len(probe) + 0x20) + 15) & ~15
@@ -838,7 +850,7 @@ class Runtime:
         size = old.size if old else size
 
         try:
-            code = codecave.assemble_cave(asm, cave, self.ev, resume)
+            code = codecave.assemble_cave(asm, cave, self.asm_ev, resume)
         except asmgen.AsmError as exc:
             raise CheatError(str(exc)) from exc
         if len(code) > size:
@@ -874,6 +886,8 @@ def execute(cheat: Cheat, game: Game, client, state, pid: int, make_buffer: Call
         if info.titleid.strip().upper() != game.title_id.upper():
             raise TitleMismatch(pid, info.titleid.strip(), game.title_id.upper())
     rt = Runtime(client, state, pid, make_buffer, log, undo)
+    rt.ftypes = {str(p.get("name")): str(p.get("type", "")).lower() for p in (cheat.params or [])
+                 if isinstance(p, dict) and str(p.get("type", "")).lower() in FLOAT_TYPES}
     for pname, pval in (params or {}).items():
         if isinstance(pval, str):
             rt.strs[pname] = pval
