@@ -766,7 +766,8 @@ class Runtime:
         picks = getattr(self.state, "site_picks", None)
         if picks is None:
             picks = self.state.site_picks = {}
-        key = (self.pid, str(s["addr"]))
+        # a Master Code dependent and a plain Section N line can share an address text: keep them apart
+        key = (self.pid, str(s["addr"]), "mc" in s, str(s.get("alt", "")))
         if key in picks and (self.turning_off or picks[key][1]):
             return picks[key][0]                 # off: same place as on; on: only re-use a verified pick
         ver = s.get("verify") or {}
@@ -795,7 +796,11 @@ class Runtime:
             done = False
             for w in wants:
                 for a, expr in cands:
-                    if w and c.read(pid, a, len(w)) == w:
+                    try:
+                        here = c.read(pid, a, len(w)) if w else b""
+                    except Exception:             # noqa: BLE001 - e.g. section N + offset is past that mapping
+                        continue
+                    if w and here == w:
                         addr, how, done = a, expr, True
                         break
                 if done:
