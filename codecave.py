@@ -96,8 +96,13 @@ def _has_code(lines: list[str]) -> bool:
     return any(l.strip() and not _LABEL.match(l) for l in lines)
 
 
-def assemble_cave(code: str, base: int, resolve: Callable[[str], int], resume: int) -> bytes:
-    """Assemble `code` to run at `base`, then append a far jump to `resume`."""
+def assemble_at(code: str, base: int, resolve: Callable[[str], int]) -> bytes:
+    """Assemble `code` to run at `base`.  [rip:EXPR] operands become RIP-relative to EXPR.
+
+    A RIP-relative displacement counts from the END of its instruction.  Every such line gets a
+    label after it, and a table of those labels' addresses is appended (".quad"), so ONE assembly
+    pass tells where each instruction ends - forward jumps to labels defined later work too.
+    The displacement field is always 4 bytes, so filling it in never moves anything."""
     lines = asmgen.substitute(code, resolve).split("\n")
     marks: dict[int, int] = {}
     plain: list[str] = []
@@ -109,27 +114,38 @@ def assemble_cave(code: str, base: int, resolve: Callable[[str], int], resume: i
             marks[i] = _eval_arith(found[0])
             line = _RIPMARK.sub("[rip + 0]", line, count=1)
         plain.append(line)
+    if not _has_code(plain):
+        return b""
+    if not marks:
+        return asmgen.assemble("\n".join(plain), base)
 
-    if marks:
-        # a RIP-relative displacement is measured from the END of its instruction,
-        # so assemble everything up to each such line to learn where it ends
-        ends: dict[int, int] = {}
-        for i in marks:
-            try:
-                ends[i] = len(asmgen.assemble("\n".join(plain[: i + 1]), base))
-            except AsmError as exc:
-                raise AsmError(
-                    f"line {i + 1}: cannot place the [rip:...] operand ({exc}). "
-                    "Avoid forward label references before that line."
-                ) from None
-        for i, target in marks.items():
-            disp = target - (base + ends[i])
-            if not -0x80000000 <= disp <= 0x7FFFFFFF:
-                raise AsmError(f"line {i + 1}: 0x{target:X} is too far from the cave for a RIP-relative operand")
-            plain[i] = plain[i].replace("[rip + 0]", f"[rip {'-' if disp < 0 else '+'} 0x{abs(disp):X}]", 1)
+    order = sorted(marks)
+    probe = []
+    for i, line in enumerate(plain):
+        probe.append(line)
+        if i in marks:
+            probe.append(f"__ripend_{i}:")
+    probe += [f".quad __ripend_{i}" for i in order]
+    try:
+        raw = asmgen.assemble("\n".join(probe), base)
+    except AsmError as exc:
+        raise AsmError(f"cannot place the [rip:...] operands ({exc})") from None
+    table = raw[len(raw) - 8 * len(order):]
+    for k, i in enumerate(order):
+        end = int.from_bytes(table[8 * k:8 * k + 8], "little")
+        disp = marks[i] - end
+        if not -0x80000000 <= disp <= 0x7FFFFFFF:
+            raise AsmError(f"line {i + 1}: 0x{marks[i]:X} is too far for a RIP-relative operand")
+        plain[i] = plain[i].replace("[rip + 0]", f"[rip {'-' if disp < 0 else '+'} 0x{abs(disp):X}]", 1)
+    out = asmgen.assemble("\n".join(plain), base)
+    if len(out) != len(raw) - 8 * len(order):
+        raise AsmError("RIP-relative operands changed the code size - report this cave")
+    return out
 
-    body = asmgen.assemble("\n".join(plain), base) if _has_code(plain) else b""
-    return body + far_jump(resume)
+
+def assemble_cave(code: str, base: int, resolve: Callable[[str], int], resume: int) -> bytes:
+    """Assemble `code` to run at `base`, then append a far jump to `resume`."""
+    return assemble_at(code, base, resolve) + far_jump(resume)
 
 
 def dollar_vars(code: str) -> list[str]:

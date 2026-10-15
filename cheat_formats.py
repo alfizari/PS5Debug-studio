@@ -237,164 +237,10 @@ def from_shn(text: str, source: str = "shn") -> dict:
 _IDENT = r"[A-Za-z_]\w*"
 
 
-def _reap_cheat(p: dict, notes: list[str]) -> dict:
-    """One .ReapPatch -> one toggle cheat."""
-    vars_ = {v["label"]: v for v in p.get("Variables", []) if v.get("label")}
-    finders = {k: v for k, v in vars_.items() if v.get("type") == 11 and v.get("offsetFinder")}
-    addrs = {k: v for k, v in vars_.items() if v.get("type") == 6}
-    # code at a fixed offset from the executable (no AOB): baseId "0" + offset, e.g.
-    # {"label":"healthSource","baseId":"0","offset":31563972,"newValue":"nop:6","defaultValue":"mov ..."}
-    # (code-cave blocks have baseId "" and isStatic false; fixed patches are marked isStatic)
-    statics = {k: v for k, v in vars_.items() if v.get("type") == 11 and not v.get("offsetFinder")
-               and (v.get("isStatic") is True or (str(v.get("baseId") or "") == "0" and int(v.get("offset") or 0) > 0))
-               and str(v.get("baseId") or "0") == "0" and str(v.get("newValue") or "").strip()}
-    codes = {k: v for k, v in vars_.items() if v.get("type") == 11 and not v.get("offsetFinder")
-             and not v.get("baseId") and k not in statics}
-    sites = {k: v for k, v in vars_.items() if v.get("type") == 11 and not v.get("offsetFinder")
-             and v.get("baseId") and v.get("baseId") != "0"}
-    data = {k: v for k, v in vars_.items() if k not in finders and k not in addrs and k not in codes
-            and k not in sites and k not in statics}
-    name = str(p.get("name") or "patch")
-    steps: list[dict] = []
-    params: list[dict] = []
-    first_site: Optional[str] = None
-
-    # 1. locate the code with the AOB signatures
-    for lbl, v in finders.items():
-        f = v["offsetFinder"]
-        pat, mask = aobmod.from_b64(f.get("UniqueAOB", ""), f.get("Mask"))
-        st = {"op": "aob", "pattern": aobmod.fmt(pat, mask), "store": lbl}
-        sec = int(f.get("sectionId") or 0)
-        if sec:
-            st["module"] = f"main#{sec}"
-            st["data"] = True
-        if v.get("offset"):
-            st["offset"] = int(v["offset"])
-        if f.get("ptr"):
-            notes.append(f"{name}: '{lbl}' uses a pointer offset finder (ptr={f['ptr']}) - not supported, "
-                         "check the address")
-        steps.append(st)
-        first_site = first_site or lbl
-    # 2. computed addresses (label = other label + offset)
-    for lbl, v in addrs.items():
-        base, off = str(v.get("baseId") or ""), int(v.get("offset") or 0)
-        expr = f"${base}" if base in vars_ else "module(main)"
-        steps.append({"op": "set", "var": lbl, "value": f"{expr}+0x{off:X}" if off else expr})
-    # 3. data variables -> small buffers next to the code (RIP-relative reach), user inputs
-    for lbl, v in data.items():
-        dv = v.get("defaultValue", 0)
-        is_float = isinstance(dv, float) and not float(dv).is_integer()
-        typ = "f32" if is_float else "u64"
-        st: dict = {"op": "alloc", "name": lbl, "size": 16, "prot": "rw"}
-        if first_site:
-            st["near"] = f"${first_site}"
-        if v.get("editor") is not None:
-            params.append({"name": lbl, "label": v.get("DisplayName") or lbl, "type": typ, "default": str(dv)})
-            st["init"] = {"type": typ, "value": f"${lbl}"}
-        else:
-            st["init"] = {"type": typ, "value": dv if is_float else str(int(dv or 0))}
-        steps.append(st)
-
-    def translate(asm: str) -> str:
-        out = []
-        for line in str(asm).replace("\r", "").split("\n"):
-            def mem(m: re.Match) -> str:
-                lbl, rest = m.group(1), m.group(2) or ""
-                ref = f"@{lbl}" if lbl in data or lbl in codes else f"${lbl}"
-                return f"[rip:{ref}{rest.replace(' ', '')}]"
-            line = re.sub(rf"\[\s*({_IDENT})\s*([+-]\s*(?:0x[0-9A-Fa-f]+|\d+))?\s*\]",
-                          lambda m: mem(m) if m.group(1) in vars_ else m.group(0), line)
-
-            def bare(m: re.Match) -> str:
-                lbl = m.group(0)
-                if lbl not in vars_:
-                    return lbl
-                return f"@{lbl}" if lbl in data or lbl in codes else f"${lbl}"
-            # only outside [rip:...] markers
-            parts = re.split(r"(\[rip:[^\]]*\])", line)
-            line = "".join(pt if pt.startswith("[rip:") else re.sub(rf"(?<![@$\w]){_IDENT}", bare, pt)
-                           for pt in parts)
-            out.append(line)
-        return "\n".join(out).strip()
-
-    # 4. each AOB site whose new code is "jmp <cave>" (+nops) becomes a hook
-    hooked: set[str] = set()
-    patch_steps: list[dict] = []
-    for lbl, v in list(finders.items()) + list(sites.items()) + list(statics.items()):
-        new = str(v.get("newValue") or "").replace("\r", "").strip()
-        if not new:
-            continue
-        if lbl in statics:
-            site = f"module(main)+0x{int(v['offset']):X}"
-        elif lbl in finders:
-            site = f"${lbl}"
-        else:
-            site = f"${v['baseId']}+0x{int(v.get('offset') or 0):X}"
-        nop = re.fullmatch(r"nop\s*:\s*(\d+)", new, flags=re.IGNORECASE)
-        if nop:                         # ShnExt shorthand: N bytes of 0x90 (original restored on off)
-            n = int(nop.group(1))
-            if not 0 < n <= 4096:
-                notes.append(f"{name}: '{lbl}' has a bad nop count ({new})")
-                continue
-            patch_steps.append({"op": "patch", "addr": site, "type": "hex", "value": " ".join(["90"] * n)})
-            continue
-        m = re.fullmatch(rf"jmp\s+({_IDENT})((?:\s*\n\s*nop)*)\s*", new, flags=re.IGNORECASE)
-        try:
-            new_len = len(asmgen.assemble(re.sub(rf"\b{m.group(1)}\b", "0x40000000", new) if m else "nop"))
-        except Exception:
-            new_len = 0
-        if m and m.group(1) in codes and new_len >= 5:
-            target = m.group(1)
-            orig_hex = ""
-            if lbl in finders:
-                pat, mask = aobmod.from_b64(finders[lbl]["offsetFinder"].get("UniqueAOB", ""),
-                                            finders[lbl]["offsetFinder"].get("Mask"))
-                off = int(v.get("offset") or 0)
-                if len(pat) >= off + new_len and all(mask[off:off + new_len]):
-                    orig_hex = pat[off:off + new_len].hex(" ").upper()
-            if not orig_hex:
-                try:
-                    b = asmgen.assemble(str(v.get("defaultValue") or "").replace("\r", ""))
-                    if len(b) == new_len:
-                        orig_hex = b.hex(" ").upper()
-                except Exception:
-                    pass
-            cave = translate(codes[target].get("defaultValue") or "")
-            # the hook appends the jump back to (site + replaced bytes) itself
-            ret = next((r for r, rv in addrs.items() if rv.get("baseId") == lbl
-                        and int(rv.get("offset") or 0) == new_len), None)
-            if ret:
-                cave = re.sub(rf"\n?\s*jmp\s+\${ret}\s*$", "", cave, flags=re.IGNORECASE)
-            st = {"op": "hook", "name": target, "addr": site, "asm": cave}
-            if orig_hex:
-                st["orig"] = orig_hex
-            else:
-                st["orig"], st["length"] = "auto", new_len
-            patch_steps.append(st)
-            hooked.add(target)
-        else:
-            patch_steps.append({"op": "asmpatch", "addr": site, "asm": translate(new)})
-    # 5. code blocks not reached through a hook: plain code buffers near the game code
-    for lbl, v in codes.items():
-        if lbl in hooked:
-            continue
-        st = {"op": "code", "name": lbl, "asm": translate(v.get("defaultValue") or ""), "auto_frame": False,
-              "auto_ret": False, "prot": "rx"}
-        if first_site:
-            st["near"] = f"${first_site}"
-        steps.append(st)
-    steps += patch_steps
-
-    cheat = {"name": name, "mode": "toggle", "steps": steps}
-    if params:
-        cheat["params"] = params
-    if p.get("info"):
-        cheat["description"] = str(p["info"]).replace("\r", "")
-    if p.get("author"):
-        cheat["author"] = str(p["author"])
-    if p.get("isMasterCode") and not re.search(r"master\s*code", name, re.IGNORECASE):
-        cheat["name"] = f"{name} (master code)"
-    return cheat
+def _reap_cheat(p: dict, notes: list[str], items: Optional[dict] = None, project: Optional[dict] = None) -> dict:
+    """One .ReapPatch -> one toggle cheat (see shnext_model)."""
+    import shnext_model
+    return shnext_model.reap_to_cheat(p, notes, items, project)
 
 
 def from_shnext_folder(proj: Path) -> tuple[dict, list[str]]:
@@ -413,7 +259,12 @@ def from_shnext_folder(proj: Path) -> tuple[dict, list[str]]:
         patches = [proj]
     meta = {}
     if meta_files:
-        meta = json.loads(meta_files[0].read_text(encoding="utf-8-sig"))
+        raw = json.loads(meta_files[0].read_text(encoding="utf-8-sig"))
+        # a decrypted .ProjReap writes the keys in lower case (game, cusa, version, processName, comment)
+        low = {str(k).lower(): v for k, v in raw.items()} if isinstance(raw, dict) else {}
+        meta = {k: low.get(k.lower()) for k in ("Game", "Cusa", "Version", "ProcessName", "Comment")}
+        meta["_project"] = low.get("name")
+        meta["_folder"] = folder.name
     if not patches:
         raise FormatError("no Patches/*.ReapPatch files found - pick the decrypted ShnExt project")
     loaded = []
@@ -430,12 +281,15 @@ def from_shnext_folder(proj: Path) -> tuple[dict, list[str]]:
 def from_shnext_data(meta: dict, loaded: list[dict], src_name: str) -> tuple[dict, list[str]]:
     """Decrypted ShnExt in memory: project metadata + the ReapPatch dicts (no files needed)."""
     notes: list[str] = []
+    items: dict = {}
     loaded = sorted(loaded, key=lambda d: d.get("index", 0))
+    import shnext_model
+    project = shnext_model.project_labels(loaded)
     cheats = []
     for p in loaded:
         if p.get("isIgnored"):
             notes.append(f"{p.get('name')}: marked ignored in the project, imported anyway")
-        cheats.append(_reap_cheat(p, notes))
+        cheats.append(_reap_cheat(p, notes, items, project))
     tid = _title(src_name, str(meta.get("Game", "")), str(meta.get("Cusa", "")))
     gname = src_name.split(tid)[0].strip("-_ ").replace("-", " ") if tid and tid in src_name else ""
     authors = sorted({c.get("author", "") for c in cheats if c.get("author")})
@@ -444,10 +298,22 @@ def from_shnext_data(meta: dict, loaded: list[dict], src_name: str) -> tuple[dic
     stored = str(meta.get("Game") or "").strip()
     if not re.search(r"[A-Za-z]{2}", stored) or re.match(r"[A-Z]{3,4}\d{3,}", stored) or " " not in stored and "_" in stored:
         stored = ""
-    game = {"format": "ps5cheat/1", "game": stored or gname or tid or "game", "title_id": tid,
+    gname = re.sub(r"(?i)^project\s+|\b[A-Z]{2}\d{4}$", "", gname).strip("-_ ")
+    if not gname and meta.get("_folder"):     # "DARK_SOULS_REMASTERED_CUSA08495_V01.03", "EP0700-CUSA07439_00-X 01.03, Item spawn"
+        f = re.sub(r"[A-Z]{2}\d{4}-[A-Z]{4}\d{5}_\d{2}-\w{16}", " ", str(meta["_folder"]))
+        f = re.sub(r"(?i)[A-Z]{4}\d{5}|(?<![A-Za-uw-z])v?\d{2}\.\d{2,3}(?:\.\d{3})?", " ", f)
+        f = re.sub(r"[\s_,-]+", " ", f).strip()
+        if re.search(r"[A-Za-z]{2}", f):
+            gname = f.title() if f.isupper() else f
+    pname = str(meta.get("_project") or "").strip()
+    if tid and tid in pname.upper() or re.fullmatch(r"(?i)project\s*\d*|new project", pname):
+        pname = ""
+    game = {"format": "ps5cheat/1", "game": stored or gname or pname or tid or "game", "title_id": tid,
             "version": str(meta.get("Version", "")), "process": str(meta.get("ProcessName") or "eboot.bin"),
             "author": ", ".join(authors), "notes": str(meta.get("Comment", "")).replace("\r", ""),
             "cheats": cheats}
+    if items:
+        game["_items"] = items                  # item dictionaries -> the pack's item lists (load_any)
     return game, notes
 
 
@@ -459,7 +325,7 @@ def load_any(path: Path) -> tuple[dict, list[str]]:
     suf = path.suffix.lower()
     if path.is_dir() or suf in (".projreap", ".reappatch"):
         game, notes = from_shnext_folder(path)
-        return {"format": "ps5pack/1", "games": [game], "items": {}}, notes
+        return {"format": "ps5pack/1", "games": [game], "items": game.pop("_items", {})}, notes
     data = path.read_bytes()
     if suf == ".mc4":
         return {"format": "ps5pack/1", "games": [from_shn(decrypt_mc4(data), "mc4")], "items": {}}, []
@@ -492,5 +358,5 @@ def load_any(path: Path) -> tuple[dict, list[str]]:
                           "decrypted project (*.ProjReap or its folder)")
     if isinstance(d, dict) and "Variables" in d:
         game, notes = from_shnext_folder(path)
-        return {"format": "ps5pack/1", "games": [game], "items": {}}, notes
+        return {"format": "ps5pack/1", "games": [game], "items": game.pop("_items", {})}, notes
     return cheat_pack.parse(data), []

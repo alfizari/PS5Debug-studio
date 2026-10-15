@@ -585,10 +585,9 @@ class Runtime:
         elif op == "asmpatch":
             # assemble at the target address (relative jumps right) and write; the
             # original bytes are restored when a toggle cheat is turned off
-            addr = self.ev(s["addr"])
+            addr = self._site(s) if ("alt" in s or "mc" in s) else self.ev(s["addr"])
             try:
-                code = asmgen.substitute(str(s["asm"]), self.asm_ev)
-                data = asmgen.assemble(code, addr)
+                data = codecave.assemble_at(str(s["asm"]), addr, self.asm_ev)   # [rip:@buf] works here too
             except asmgen.AsmError as exc:
                 raise CheatError(str(exc)) from exc
             self.undo.append((addr, c.read(pid, addr, len(data))))

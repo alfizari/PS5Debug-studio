@@ -90,9 +90,13 @@ class Report:
     errors: list = field(default_factory=list)
     warnings: list = field(default_factory=list)
 
+    rich: bool = False          # ShnExt: hooks / AOBs / caves - valid without fixed byte lines
+    summary: str = ""           # ShnExt: what the patch holds ("1 AOB, 1 hook, 1 input")
+
     @property
     def ok(self) -> bool:
-        return not self.errors and bool(self.lines) and all(ln.off is not None for ln in self.lines)
+        return (not self.errors and (bool(self.lines) or self.rich)
+                and all(ln.off is not None for ln in self.lines))
 
     def missing_off(self) -> list:
         return [ln for ln in self.lines if ln.off is None]
@@ -182,9 +186,33 @@ def _desc(s: dict) -> str:
     return f"{s.get('op')} {s.get('addr', '')}".strip()
 
 
-def analyze(game, cheat, fmt: str) -> Report:
+def _analyze_shnext(game, cheat, items: Optional[dict]) -> Report:
+    """ShnExt keeps AOBs, hooks, caves, data and inputs (shnext_model).  Fixed-offset sites need the
+    game's original bytes: each one is a Line whose off the dialog reads from the game."""
+    import shnext_model
+    r = Report(cheat, rich=True)
+    wanted: list[tuple[str, int]] = []
+
+    def read(expr: str, n: int):
+        wanted.append((expr, n))
+        return None
+    _patch, errs = shnext_model.cheat_to_reap(cheat, 0, game.author or "", items, read, game.process or "eboot.bin")
+    r.errors = [e for e in errs if "needs the game's original bytes" not in e]
+    ops = [str(s.get("op", "")).lower() for s in cheat.steps if isinstance(s, dict)]
+    parts = [(ops.count("aob"), "AOB"), (ops.count("hook"), "hook"),
+             (ops.count("asmpatch") + ops.count("write") + ops.count("patch"), "patch"),
+             (ops.count("code"), "code block"), (len(cheat.params or []), "input")]
+    r.summary = ", ".join(f"{n} {w}{'s' if n > 1 else ''}" for n, w in parts if n)
+    for expr, n in wanted:
+        r.lines.append(Line(0, 0, b"\0" * n, None, expr, f"original bytes at {expr}"))
+    return r
+
+
+def analyze(game, cheat, fmt: str, items: Optional[dict] = None) -> Report:
     """Can `cheat` be written as `fmt` ('shn' / 'mc4' / 'json')?  Lines whose off value must come
     from the game (patch / asmpatch, or a write without an off step) get off=None."""
+    if fmt == "shnext":
+        return _analyze_shnext(game, cheat, items)
     r = Report(cheat)
     rts = (_StaticRT(_B1, game.process), _StaticRT(_B2, game.process))
     if cheat.params:
@@ -449,26 +477,19 @@ def _split_line(on: bytes, off: bytes) -> list[tuple[int, bytes, bytes]]:
     return out
 
 
-def build_shnext(game, reports: list) -> bytes:
+def build_shnext(game, reports: list, items: Optional[dict] = None) -> bytes:
+    import shnext_model
     m, why = shnext_module()
     if m is None:
         raise ValueError(why)
     authors = [a.strip() for a in (game.author or "").split(",") if a.strip()]
     entries = []
     for i, r in enumerate(reports):
-        c = r.cheat
-        variables = []
-        for ln in r.lines:
-            for rel, on, off in _split_line(ln.on, ln.off):
-                variables.append({
-                    "index": 0, "defaultValue": asm_text(off) + "\r\n", "newValue": asm_text(on), "type": 11,
-                    "editor": None, "isAlwaysEnabled": False, "isStatic": True, "offsetFinder": None,
-                    "offsetFinderPtr": None, "option": None, "label": f"line{len(variables) + 1}",
-                    "DisplayName": None, "comment": None, "baseId": "0", "offset": ln.offset + rel})
-        patch = {"info": (c.description or "").replace("\n", "\r\n"), "name": c.name, "index": i,
-                 "author": getattr(c, "author", "") or (authors[0] if authors else ""),
-                 "isMasterCode": bool(re.search(r"master\s*code", c.name, re.IGNORECASE)),
-                 "isIgnored": False, "Variables": variables}
+        known = {(ln.addr, len(ln.on)): ln.off for ln in r.lines}
+        patch, errs = shnext_model.cheat_to_reap(r.cheat, i, authors[0] if authors else "", items,
+                                                 lambda e, n: known.get((e, n)), game.process or "eboot.bin")
+        if patch is None:
+            raise ValueError(f"{r.cheat.name}: " + "; ".join(errs))
         js = json.dumps(patch, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         entries.append(base64.b64encode(m.encrypt_entry(i, _raw_deflate(js))).decode("ascii"))
     outer = {"Modder": authors, "patchEntries": entries, "dictionarys": [], "label": None,
@@ -478,7 +499,7 @@ def build_shnext(game, reports: list) -> bytes:
     return _raw_deflate(json.dumps(outer, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
 
 
-def build(fmt: str, game, reports: list) -> bytes:
+def build(fmt: str, game, reports: list, items: Optional[dict] = None) -> bytes:
     if fmt == "shn":
         return build_shn(game, reports).encode("utf-8")
     if fmt == "mc4":
@@ -486,7 +507,7 @@ def build(fmt: str, game, reports: list) -> bytes:
     if fmt == "json":
         return build_json(game, reports).encode("utf-8")
     if fmt == "shnext":
-        return build_shnext(game, reports)
+        return build_shnext(game, reports, items)
     raise ValueError(fmt)
 
 

@@ -115,6 +115,12 @@ class ExportDialog:
         g.title_id = g.title_id.upper()
         return g
 
+    def _items(self) -> dict:
+        """item ID lists the cheats use (ShnExt writes them as dropdown dictionaries)"""
+        store = getattr(self.app, "items", None)
+        lists = {p.get("items") for c in self.cheats for p in c.params if isinstance(p, dict) and p.get("items")}
+        return {x: store.items(x) for x in lists if store is not None and store.items(x)}
+
     def _changed(self) -> None:
         fmt = self.fmt.get()
         self.app._last_export_fmt = fmt
@@ -125,7 +131,7 @@ class ExportDialog:
             self.hf.pack(fill="x", pady=(8, 0))
             self.of.pack(side="bottom", fill="x", pady=(6, 0))
             self.lf.pack(fill="both", expand=True, pady=(8, 0))
-        self.reports = [] if own else [ce.analyze(self._hdr_game(), c, fmt) for c in self.cheats]
+        self.reports = [] if own else [ce.analyze(self._hdr_game(), c, fmt, self._items()) for c in self.cheats]
         for r in self.reports:                           # original bytes already read for another type
             for ln in r.missing_off():
                 ln.off = self._orig.get((ln.addr, len(ln.on)))
@@ -160,7 +166,9 @@ class ExportDialog:
                        "press 'Read original bytes from the game', or add off steps")
             else:
                 st, tag, why = "✔", "", "; ".join(r.warnings) or "ok"
-            self.tree.insert("", "end", iid=str(i), values=(st, r.cheat.name, len(r.lines), why), tags=(tag,))
+            if getattr(r, "summary", ""):
+                why = f"{why}  -  {r.summary}" if why != "ok" else f"ok  -  {r.summary}"
+            self.tree.insert("", "end", iid=str(i), values=(st, r.cheat.name, len(r.lines) or "", why), tags=(tag,))
         ok = sum(1 for r in self.reports if r.ok)
         bad = sum(1 for r in self.reports if r.errors)
         parts = [f"{ok} of {len(self.reports)} cheat(s) can be exported"]
@@ -284,7 +292,7 @@ class ExportDialog:
         if not path.lower().endswith(ext):
             path += ext                                  # never write mc4 bytes into a .shn etc.
         try:
-            data = ce.build(fmt, hg, ok)
+            data = ce.build(fmt, hg, ok, self._items())
         except Exception as exc:
             messagebox.showerror("Export", f"Could not build the {ext} file:\n\n{exc}", parent=self.win)
             return
