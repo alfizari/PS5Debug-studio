@@ -197,6 +197,11 @@ class ScannerTab:
         head.pack(fill="x")
         self.found_var = tk.StringVar(value="Found: 0")
         ttk.Label(head, textvariable=self.found_var, style="Title.TLabel").pack(side="left")
+        ttk.Button(head, text="Add selected", style="Small.TButton",
+                   command=self.add_selected_results).pack(side="left", padx=(10, 0))
+        ttk.Button(head, text="Add all", style="Small.TButton",
+                   command=self.add_all_results).pack(side="left", padx=(4, 0))
+        ttk.Label(head, text="Shift / Ctrl+click picks several", style="Muted.TLabel").pack(side="left", padx=(8, 0))
         self.page_var = tk.StringVar(value="")
         ttk.Button(head, text="▶", width=3, style="Small.TButton",
                    command=lambda: self._goto_page(self.page + 1)).pack(side="right")
@@ -222,6 +227,7 @@ class ScannerTab:
         self.res.bind("<Return>", lambda _e: self.add_selected_results())
         self.res.bind("<Button-3>", self._res_menu)
         self.res.bind("<Control-c>", lambda _e: self._copy_res_addr())
+        self.res.bind("<Control-a>", lambda _e: (self.res.selection_set(self.res.get_children()), "break")[1])
 
         # ---- controls (right) - scrolls when the window is too short for all the options
         rs = ScrollFrame(top, horizontal=False)
@@ -848,12 +854,47 @@ class ScannerTab:
                 out.append(self.rows[i])
         return out
 
+    MAX_ADD_ALL = 10000
+
     def add_selected_results(self) -> None:
         spec = self.scan_spec
         if spec is None:
             return
-        for r in self._sel_results():
-            self._add_entry(Entry("No description", r.addr, TypeSpec(**spec.__dict__)))
+        sel = self._sel_results()
+        if not sel:
+            self.status_var.set("Pick results first (Shift / Ctrl+click several, Ctrl+A for the whole page)")
+            return
+        self._add_entries([Entry("No description", r.addr, TypeSpec(**spec.__dict__)) for r in sel])
+        self.status_var.set(f"Added {len(sel)} address(es) to the list")
+
+    def add_all_results(self) -> None:
+        """Every result of the current scan (all pages) to the address list."""
+        spec = self.scan_spec
+        if spec is None or self.scanning:
+            return
+        total = self.session.count if (self.session and self.session.active) else len(self.rows)
+        if not total:
+            return
+        n = min(total, self.MAX_ADD_ALL)
+        if total > 1000 and not messagebox.askyesno(
+                "Add all", f"Add {n:,} addresses to the address list?" +
+                (f"\n\n(Only the first {self.MAX_ADD_ALL:,} of {total:,} - narrow the scan first.)" if total > n else "") +
+                "\n\nA very long list refreshes more slowly.", parent=self.root):
+            return
+        if total <= len(self.rows) or not (self.session and self.session.active):
+            rows = list(self.rows[:n])
+            self._add_entries([Entry("No description", r.addr, TypeSpec(**spec.__dict__)) for r in rows])
+            self.status_var.set(f"Added {len(rows):,} address(es) to the list")
+            return
+
+        def work() -> None:
+            rows = []
+            for start in range(0, n, PAGE):
+                rows += self.session.get(start, min(PAGE, n - start))
+            entries = [Entry("No description", r.addr, TypeSpec(**spec.__dict__)) for r in rows]
+            self._post(lambda: (self._add_entries(entries),
+                                self.status_var.set(f"Added {len(entries):,} address(es) to the list")))
+        self._run(work, f"Loading {n:,} results…")
 
     def _copy_res_addr(self) -> None:
         sel = self._sel_results()
@@ -1028,8 +1069,15 @@ class ScannerTab:
 
     # ----------------------------------------------------------- address list
     def _add_entry(self, e: Entry) -> None:
-        self.entries.append(e)
+        self._add_entries([e])
+
+    def _add_entries(self, entries: list) -> None:
+        """one redraw for any number of new entries"""
+        if not entries:
+            return
+        self.entries.extend(entries)
         self._refresh_list()
+        self.lst.see(entries[-1].iid) if entries[-1].iid else None
 
     def _refresh_list(self) -> None:
         self.lst.delete(*self.lst.get_children())

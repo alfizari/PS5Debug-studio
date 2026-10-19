@@ -27,6 +27,32 @@ OWN = {
 ORDER = ("ps5c", "pack_json", "shn", "mc4", "json", "shnext")
 
 
+def padding_runs(chunks, min_len: int = 64):
+    """(start, length, byte) of every run of 00 or CC bytes at least min_len long; chunks yields
+    (address, bytes) in order, runs may cross chunk borders."""
+    import re as _re
+    cur = None                                         # [start, length, byte]
+    for addr, data in chunks:
+        for mt in _re.finditer(rb"\x00+|\xcc+", data):
+            st, ln, by = addr + mt.start(), mt.end() - mt.start(), data[mt.start()]
+            if cur and cur[2] == by and cur[0] + cur[1] == st:
+                cur[1] += ln                           # continues across the chunk border
+            else:
+                if cur and cur[1] >= min_len:
+                    yield tuple(cur)
+                cur = [st, ln, by]
+            if mt.end() != len(data):                  # the run ends inside this chunk
+                if cur[1] >= min_len:
+                    yield tuple(cur)
+                cur = None
+        if data and cur and cur[0] + cur[1] != addr + len(data):
+            if cur[1] >= min_len:
+                yield tuple(cur)
+            cur = None
+    if cur and cur[1] >= min_len:
+        yield tuple(cur)
+
+
 class ExportDialog:
     def __init__(self, app, store, game, cheats: list) -> None:
         self.app, self.store, self.game = app, store, game
@@ -101,6 +127,30 @@ class ExportDialog:
         self.read_msg = ttk.Label(of, text="", wraplength=700, justify="left")
         self.read_msg.pack(side="left", padx=8)
 
+        # ---- code caves (hooks / buffers) for .shn / .mc4 / GoldHEN .json
+        self.cf = cf = ttk.LabelFrame(top, text="Code caves (cheats with a hook or @buffers)", padding=6)
+        saved = getattr(app, "_cave_offsets", {}).get((game.title_id or "").upper(), {})
+        self.cave_code = tk.StringVar(value=saved.get("code", ""))
+        self.cave_data = tk.StringVar(value=saved.get("data", ""))
+        self._cave_free: dict = {}
+        ttk.Label(cf, text="Cave code at module(main)+0x").grid(row=0, column=0, sticky="w")
+        ttk.Entry(cf, textvariable=self.cave_code, width=12).grid(row=0, column=1, sticky="w")
+        ttk.Label(cf, text="  buffers the code writes at +0x").grid(row=0, column=2, sticky="w")
+        ttk.Entry(cf, textvariable=self.cave_data, width=12).grid(row=0, column=3, sticky="w")
+        self.find_btn = ttk.Button(cf, text="Find free space", command=self._find_cave)
+        self.find_btn.grid(row=0, column=4, padx=(10, 0))
+        self.cave_msg = ttk.Label(cf, text="", wraplength=900, justify="left")
+        self.cave_msg.grid(row=1, column=0, columnspan=6, sticky="w", pady=(4, 0))
+        ttk.Label(cf, foreground="#7f8c8d", wraplength=900, justify="left", text=(
+            "These formats have no memory of their own, so the cave code is written into unused bytes of the "
+            "game executable (00 / CC padding) and simply stays there; turning the cheat off restores the hook. "
+            "Offsets are the module(main)+0x... numbers this tool shows - nothing to subtract (the .shn "
+            "Offset is the same number). Buffers the code only reads go next to the code; buffers it writes "
+            "need memory the game does not use (code pages are read-only).")).grid(
+            row=2, column=0, columnspan=6, sticky="w", pady=(2, 0))
+        for v in (self.cave_code, self.cave_data):
+            v.trace_add("write", lambda *_: self._cave_edited())
+
         # ---- buttons
         bf = ttk.Frame(top)
         bf.pack(side="bottom", fill="x", pady=(8, 0))
@@ -171,13 +221,19 @@ class ExportDialog:
         fmt = self.fmt.get()
         self.app._last_export_fmt = fmt
         own = fmt in OWN
-        for f in (self.hf, self.lf, self.of):
+        for f in (self.hf, self.lf, self.of, self.cf):
             f.pack_forget()
         self.hf.pack(fill="x", pady=(8, 0))             # every format: the same naming standard
+        caves = fmt in ("shn", "mc4", "json") and self._has_caves()
         if not own:
             self.of.pack(side="bottom", fill="x", pady=(6, 0))
+            if caves:
+                self.cf.pack(side="bottom", fill="x", pady=(6, 0))
             self.lf.pack(fill="both", expand=True, pady=(8, 0))
-        self.reports = [] if own else [ce.analyze(self._hdr_game(), c, fmt, self._items()) for c in self.cheats]
+        plan = self._cave_plan() if caves else None
+        hg = self._hdr_game()
+        self.reports = [] if own else [ce.analyze(hg, c, fmt, self._items(), cave=plan) for c in self.cheats]
+        self._plan = plan
         for r in self.reports:                           # original bytes already read for another type
             for ln in r.missing_off():
                 ln.off = self._orig.get((ln.addr, len(ln.on)))
@@ -237,6 +293,141 @@ class ExportDialog:
         self.read_btn.configure(state="normal" if need and connected else "disabled")
         if need and not connected:
             self.read_msg.configure(text="Connect to the console with the game running to read them.")
+
+    # ------------------------------------------------------------------ code caves
+    def _has_caves(self) -> bool:
+        return any(str(s.get("op", "")).lower() in ("hook", "alloc") for c in self.cheats for s in c.steps
+                   if isinstance(s, dict))
+
+    @staticmethod
+    def _hex(text: str):
+        t = text.strip().lower().replace("module(main)+", "")
+        if not t:
+            return None
+        try:
+            return int(t, 16)
+        except ValueError:
+            return None
+
+    def _cave_plan(self) -> "ce.CavePlan":
+        code, data = self._hex(self.cave_code.get()), self._hex(self.cave_data.get())
+        free = self._cave_free.get(code)
+        return ce.CavePlan(code_off=code, data_off=data, code_free=free)
+
+    def _cave_edited(self) -> None:
+        store = getattr(self.app, "_cave_offsets", None)
+        if store is None:
+            store = self.app._cave_offsets = {}
+        store[(self.game.title_id or "").upper()] = {"code": self.cave_code.get().strip(),
+                                                    "data": self.cave_data.get().strip()}
+        bad = [n for n, v in (("cave code", self.cave_code), ("data", self.cave_data))
+               if v.get().strip() and self._hex(v.get()) is None]
+        self.cave_msg.configure(text=("✖ " + ", ".join(bad) + ": write a hex offset like 1BC000") if bad else "",
+                                foreground="#c0392b")
+        if self._job_cave:
+            self.win.after_cancel(self._job_cave)
+        self._job_cave = self.win.after(300, self._changed)
+
+    _job_cave = None
+
+    def _cave_need(self) -> int:
+        """bytes the caves of the selected cheats take (assembled at a trial offset)"""
+        plan = ce.CavePlan(code_off=0, data_off=0x10000000)
+        hg = self._hdr_game()
+        for c in self.cheats:
+            ce.analyze(hg, c, self.fmt.get(), self._items(), cave=plan)
+        return max(plan.used_code, 16)
+
+    def _find_cave(self) -> None:
+        """Scan the game's executable code for 00 / CC padding big enough for the caves (or check the
+        offset typed in).  Runs of padding at the END of a code mapping are preferred: that is space the
+        linker left after the last function, never used by the game."""
+        if not getattr(self.app.client, "connected", False):
+            self.cave_msg.configure(text="Connect to the console with the game running first.", foreground="#b9770e")
+            return
+        try:
+            pid = self.app._pid()
+        except Exception as exc:
+            self.cave_msg.configure(text=str(exc), foreground="#c0392b")
+            return
+        need = self._cave_need()
+        typed = self._hex(self.cave_code.get())
+        app, client = self.app, self.app.client
+        self.cave_msg.configure(text="Reading the game's code...", foreground="#7f8c8d")
+
+        def post(fn):
+            app.root.after(0, lambda: self.win.winfo_exists() and fn())
+
+        def work() -> None:
+            maps = client.maps(pid)
+            exe = [m for m in maps if m.prot & 4]
+            if not exe:
+                raise RuntimeError("the game has no executable mapping")
+            main = min(exe, key=lambda m: m.start)
+            base = main.start
+            code_maps = sorted((m for m in exe if m.name == main.name), key=lambda m: m.start)
+            if typed is not None:
+                at = base + typed
+                m = next((m for m in code_maps if m.start <= at < m.end), None)
+                if m is None:
+                    post(lambda: self.cave_msg.configure(
+                        text=f"✖ +0x{typed:X} is not in the game's code (it must be executable memory)",
+                        foreground="#c0392b"))
+                    return
+                n = min(need, m.end - at)
+                b = client.read(pid, at, n)
+                ok = n == need and all(x in (0x00, 0xCC) for x in b)
+                free = 0
+                if ok:
+                    chunk = client.read(pid, at, min(m.end - at, 0x10000))
+                    fb = chunk[0]
+                    free = next((i for i, x in enumerate(chunk) if x != fb), len(chunk))
+                    self._cave_free[typed] = free
+                pad = "CC" if b[:1] == b"\xcc" else "00"
+                msg = (f"✔ +0x{typed:X}: {free} free bytes ({pad} padding), the caves "
+                       f"need {need}") if ok else (f"✖ +0x{typed:X} is not free: the {need} bytes there are not all 00 / CC "
+                                                    "- clear the field and press Find free space")
+                post(lambda: (self.cave_msg.configure(text=msg, foreground="#1e8449" if ok else "#c0392b"),
+                              self._changed()))
+                return
+            best = None                               # (kind, length, start, byte)
+            for m in code_maps:
+                def chunks(m=m):
+                    pos = m.start
+                    while pos < m.end:
+                        n = min(0x100000, m.end - pos)
+                        try:
+                            yield pos, client.read(pid, pos, n)
+                        except Exception:
+                            yield pos, b"\x01" * n       # unreadable: not free
+                        pos += n
+                        post(lambda p=pos: self.cave_msg.configure(
+                            text=f"Reading the game's code... {100 * (p - m.start) // max(1, m.end - m.start)}% "
+                                 f"of {m.name}", foreground="#7f8c8d"))
+                for start, length, byte in padding_runs(chunks(), 64):
+                    kind = 2 if start + length == m.end else (1 if byte == 0xCC else 0)
+                    if best is None or (length >= need, kind, length) > (best[1] >= need, best[0], best[1]):
+                        best = (kind, length, start, byte)
+            if best is None:
+                post(lambda: self.cave_msg.configure(text="✖ no free 00 / CC space of 64+ bytes in the game's code",
+                                                     foreground="#c0392b"))
+                return
+            kind, length, start, byte = best
+            off = ((start - base) + 15) & ~15
+            free = start + length - (base + off)
+            self._cave_free[off] = free
+
+            def done():
+                self.cave_code.set(f"{off:X}")
+                what = {2: "at the end of the code", 1: "int3 (CC) padding", 0: "zero padding inside the code"}[kind]
+                warn = "" if kind else "  ⚠ zeros inside the code can be data - prefer CC / end-of-code space"
+                ok = free >= need
+                self.cave_msg.configure(
+                    text=f"{'✔' if ok else '✖'} free space +0x{off:X}: {free} bytes ({what}), the caves need {need}{warn}",
+                    foreground="#1e8449" if ok and kind else ("#b9770e" if ok else "#c0392b"))
+            post(done)
+
+        app._run_bg(work, "Looking for free space in the game's code...")
 
     def _show_detail(self, _e=None) -> None:
         sel = self.tree.selection()

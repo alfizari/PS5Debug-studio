@@ -6,6 +6,13 @@ only when every step is a fixed patch of the game executable - no code caves all
 time, no AOB scans, pointers, hooks, calls, parameters or Python.  `analyze` checks each cheat
 and says why one cannot be exported; nothing is ever half-converted.
 
+Code caves (hook + @buffers) export too when a CavePlan gives free space inside the game executable:
+the cave code is assembled at that fixed offset (relative jumps, so it works wherever the game
+loads), written as a line whose off value is the same code (it stays, unused, when the cheat is
+off), and the hook site becomes "jmp cave" with the original bytes as its off value.  The cheat
+then is plain lines, like hand-made GoldHEN code-cave cheats.  @buffers the code only reads go into
+the code area; buffers it writes need a writable area (CavePlan.data_off).
+
 Rules (same as the files in the GoldHEN cheat repository and ReverseTelnet's AIO converter):
   * offsets are relative to the game executable (section 0 unless the cheat uses main#N);
     GoldHEN .json has no section field, so it needs section 0
@@ -182,6 +189,207 @@ def _value(rts, s: dict) -> bytes:
     return outs[0]
 
 
+@dataclass
+class CavePlan:
+    """Where code caves go when exporting to .shn / .mc4 / GoldHEN .json: offsets from the start of the
+    game executable (module(main)+offset - the numbers the tool shows; nothing to subtract)."""
+    code_off: Optional[int] = None      # free space in the executable's code (00 / CC padding)
+    data_off: Optional[int] = None      # writable space for @buffers the code writes
+    code_free: Optional[int] = None     # bytes known to be free at code_off (from "Find free space")
+    data_free: Optional[int] = None
+    used_code: int = 0                  # filled while analyzing the cheats, in order
+    used_data: int = 0
+
+    def reset(self) -> None:
+        self.used_code = self.used_data = 0
+
+
+_WRITE_SKIP = ("cmp", "test", "push", "ucomiss", "ucomisd", "comiss", "comisd", "bt", "prefetch")
+
+
+def _writes_buffer(asm: str, name: str) -> bool:
+    """Does an instruction use @name in its FIRST operand as memory (a store)?"""
+    pat = re.compile(r"@" + re.escape(name) + r"\b")
+    for line in str(asm).split("\n"):
+        body = line.split(";", 1)[0].split("//", 1)[0].strip()
+        m = re.match(r"(?:[A-Za-z_][\w.]*:\s*)?([A-Za-z][\w.]*)\s+(.*)", body)
+        if not m or m.group(1).lower().startswith(_WRITE_SKIP):
+            continue
+        ops, depth, first = m.group(2), 0, ""
+        for ch in ops:                                  # the first operand (commas inside [] do not count)
+            if ch == "[":
+                depth += 1
+            elif ch == "]":
+                depth -= 1
+            elif ch == "," and depth == 0:
+                break
+            first += ch
+        if "[" in first and pat.search(first):
+            return True
+    return False
+
+
+def _param_defaults(cheat) -> dict:
+    out = {}
+    for p in cheat.params or []:
+        if not isinstance(p, dict):
+            continue
+        t, d = str(p.get("type", "u32")).lower(), p.get("default", 0)
+        try:
+            if t in ("f32", "f64"):
+                import struct
+                out[p["name"]] = struct.unpack("<I", struct.pack("<f", float(d)))[0] if t == "f32" \
+                    else struct.unpack("<Q", struct.pack("<d", float(d)))[0]
+            else:
+                out[p["name"]] = int(str(d or 0), 0) & 0xFFFF_FFFF_FFFF_FFFF
+        except (TypeError, ValueError):
+            out[p["name"]] = 0
+    return out
+
+
+def _static_caves(rts, cheat, cave: CavePlan, r: "Report") -> list:
+    """hook / alloc steps -> fixed lines inside the executable (see the module doc).  Returns the
+    lines; problems go to r.errors."""
+    import asmgen
+    import codecave
+    steps = [s for s in cheat.steps if isinstance(s, dict)]
+    hooks = [s for s in steps if str(s.get("op", "")).lower() == "hook"]
+    allocs = [s for s in steps if str(s.get("op", "")).lower() == "alloc"]
+    if not hooks and not allocs:
+        return []
+    if cave.code_off is None:
+        r.errors.append("uses a code cave - set 'Code caves at module(main)+0x...' below (free space in the "
+                        "game executable)")
+        return []
+    defaults = _param_defaults(cheat)
+    used_params = set()
+    lines, bufs = [], {}
+    asm_all = "\n".join(str(h.get("asm", "")) for h in hooks)
+
+    def place(size: int, writable: bool) -> Optional[int]:
+        size = (size + 15) & ~15
+        if writable:
+            if cave.data_off is None:
+                return None
+            off = cave.data_off + cave.used_data
+            cave.used_data += size
+            return off
+        off = ((cave.code_off + cave.used_code) + 15) & ~15
+        cave.used_code = off - cave.code_off + size
+        return off
+
+    rt = rts[0]
+    for a in allocs:
+        name = str(a.get("name", ""))
+        try:
+            size = int(rt.ev(a.get("size", 16))) if not str(a.get("size", "")).strip().startswith("$") \
+                else defaults.get(str(a["size"]).strip()[1:], 16)
+        except Exception:
+            size = 16
+        init = b""
+        ini = a.get("init") or {}
+        if ini:
+            val = ini.get("value", "")
+            if isinstance(val, str) and val.strip().startswith("$") and val.strip()[1:] in defaults:
+                used_params.add(val.strip()[1:])
+                pdef = next((p.get("default") for p in cheat.params if p.get("name") == val.strip()[1:]), 0)
+                val = pdef
+            try:
+                init = rt.encode(ini.get("type", "u64"), val, False)
+            except Exception as exc:
+                r.errors.append(f"buffer @{name}: start value {val!r}: {exc}")
+                continue
+        size = max(size, len(init), 1)
+        writes = _writes_buffer(asm_all, name)
+        off = place(size, writes)
+        if off is None:
+            r.errors.append(f"buffer @{name} is written by the cave code - give a writable 'data' location "
+                            "(memory the game does not use), or keep the value in a register")
+            continue
+        bufs[name] = off
+        data = init.ljust(size, b"\0")
+        lines.append(Line(0, off, data, data, f"module(main)+0x{off:X}", f"@{name} ({size} bytes)"))
+
+    def resolver(base_rt, base):
+        def res(expr: str) -> int:
+            e = str(expr)
+            for n, o in bufs.items():
+                e = re.sub(r"@" + re.escape(n) + r"\b", f"0x{base + o:X}", e)
+            bad = re.search(r"@([A-Za-z_]\w*)", e)
+            if bad:
+                raise _NotStatic(f"uses @{bad.group(1)}, which no alloc step of this cheat creates")
+
+            def dollar(m):
+                used_params.add(m.group(1))
+                if m.group(1) not in defaults:
+                    raise _NotStatic(f"uses ${m.group(1)}, which is not an input of this cheat")
+                return f"0x{defaults[m.group(1)]:X}"
+            e = re.sub(r"\$([A-Za-z_]\w*)", dollar, e)
+            return base_rt.ev(e)
+        return res
+
+    for h in hooks:
+        name = str(h.get("name") or "hook")
+        try:
+            sec, site = _addr(rts, h["addr"])
+        except _NotStatic as exc:
+            if "variable" in str(exc):
+                r.errors.append(f"hook {name}: found by AOB at run time - these formats need a fixed offset: in "
+                                "the Code cave window untick 'Locate by AOB' and save again (ShnExt keeps AOBs)")
+            else:
+                r.errors.append(f"hook {name}: {exc}")
+            continue
+        if sec != 0:
+            r.errors.append(f"hook {name}: the hook address must be module(main)+offset")
+            continue
+        o = str(h.get("orig", "")).strip()
+        if o.lower() == "auto":
+            orig, n = None, int(h.get("length", 5))
+        else:
+            try:
+                orig = bytes.fromhex(re.sub(r"[^0-9A-Fa-f]", "", o))
+            except ValueError:
+                r.errors.append(f"hook {name}: bad 'orig' bytes")
+                continue
+            n = len(orig)
+        if n < codecave.JMP_NEAR:
+            r.errors.append(f"hook {name}: {n} byte(s) replaced, a jump needs 5")
+            continue
+        outs = []
+        start = ((cave.code_off + cave.used_code) + 15) & ~15
+        try:
+            for base_rt, base in ((rts[0], _B1), (rts[1], _B2)):
+                body = codecave.assemble_at(str(h.get("asm", "")), base + start, resolver(base_rt, base))
+                end = base + start + len(body)
+                rel = (base + site + n) - (end + 5)
+                outs.append(body + b"\xE9" + rel.to_bytes(4, "little", signed=True))
+        except _NotStatic as exc:
+            r.errors.append(f"hook {name}: {exc}")
+            continue
+        except (asmgen.AsmError, codecave.CaveError, OverflowError) as exc:
+            r.errors.append(f"hook {name}: cannot assemble the cave ({exc})")
+            continue
+        if outs[0] != outs[1]:
+            r.errors.append(f"hook {name}: the cave code holds an absolute address (e.g. mov rax, @buf or a "
+                            "module address as a number) - use a RIP-relative form like [rip:@buf] / lea instead")
+            continue
+        code = outs[0]
+        cave.used_code = start - cave.code_off + len(code)
+        lines.append(Line(0, start, code, code, f"module(main)+0x{start:X}", f"cave {name} ({len(code)} bytes)"))
+        jmp = b"\xE9" + (start - (site + 5)).to_bytes(4, "little", signed=True) + b"\x90" * (n - 5)
+        lines.append(Line(0, site, jmp, orig, str(h["addr"]), f"hook {name} -> cave +0x{start:X}"))
+    if cave.code_free is not None and cave.used_code > cave.code_free:
+        r.errors.append(f"the code caves need {cave.used_code} bytes, the free space found is {cave.code_free}")
+    if cave.data_free is not None and cave.used_data > cave.data_free:
+        r.errors.append(f"the buffers need {cave.used_data} bytes, the data space given is {cave.data_free}")
+    if used_params:
+        r.warnings.append("inputs are fixed at their defaults (these formats cannot ask): " +
+                          ", ".join(f"{n}={next((p.get('default') for p in cheat.params if p.get('name') == n), '?')}"
+                                    for n in sorted(used_params)))
+    r.summary = f"cave at +0x{cave.code_off:X}" if hooks else ""
+    return lines
+
+
 def _desc(s: dict) -> str:
     return f"{s.get('op')} {s.get('addr', '')}".strip()
 
@@ -208,15 +416,22 @@ def _analyze_shnext(game, cheat, items: Optional[dict]) -> Report:
     return r
 
 
-def analyze(game, cheat, fmt: str, items: Optional[dict] = None) -> Report:
+def analyze(game, cheat, fmt: str, items: Optional[dict] = None, cave: Optional[CavePlan] = None) -> Report:
     """Can `cheat` be written as `fmt` ('shn' / 'mc4' / 'json')?  Lines whose off value must come
     from the game (patch / asmpatch, or a write without an off step) get off=None."""
     if fmt == "shnext":
         return _analyze_shnext(game, cheat, items)
     r = Report(cheat)
     rts = (_StaticRT(_B1, game.process), _StaticRT(_B2, game.process))
+    ops_all = [str(s.get("op", "")).lower() for s in cheat.steps if isinstance(s, dict)]
+    caved = cave is not None and ("hook" in ops_all or "alloc" in ops_all)
+    cave_lines = _static_caves(rts, cheat, cave, r) if caved else []
     if cheat.params:
-        r.errors.append("has parameters (inputs) - .shn/.mc4/.json cheats cannot ask for a value")
+        # with a static cave, inputs used only by the cave code / buffers are fixed at their defaults
+        other = [s for s in cheat.steps if isinstance(s, dict) and str(s.get("op", "")).lower() not in ("hook", "alloc")]
+        if not caved or any(re.search(r"\$" + re.escape(str(p.get("name"))) + r"\b", json.dumps(other + list(cheat.off)))
+                            for p in cheat.params if isinstance(p, dict)):
+            r.errors.append("has parameters (inputs) - .shn/.mc4/.json cheats cannot ask for a value")
     once = cheat.mode == "once"
     if once and fmt not in ("json",):
         r.errors.append("is a run-once cheat - .shn/.mc4/.ShnExt only have on/off cheats (GoldHEN .json has buttons)")
@@ -232,6 +447,12 @@ def analyze(game, cheat, fmt: str, items: Optional[dict] = None) -> Report:
                 continue
             if op in _DROPPED_OPS:
                 r.warnings.append(f"the '{op}' step is left out (these formats cannot check bytes first)")
+                continue
+            if caved and op in ("hook", "alloc") and not off_side:
+                continue                                  # done by _static_caves
+            if op in ("hook", "alloc") and not off_side and cave is None:
+                r.errors.append(f"step {i + 1} {'installs a hook' if op == 'hook' else 'allocates a buffer'} - "
+                                "give a code cave location (free space in the game executable) to export it")
                 continue
             if op not in ("write", "patch", "asmpatch") or (off_side and op == "asmpatch"):
                 why = {"alloc": "allocates memory (a code cave made at run time)",
@@ -262,6 +483,7 @@ def analyze(game, cheat, fmt: str, items: Optional[dict] = None) -> Report:
         return out
 
     ons = walk(list(cheat.steps), False)
+    hook_sites = {ln.offset for ln in cave_lines if ln.what.startswith("hook ")}
     offs = walk(list(cheat.off), True)
     if not cheat.steps:
         r.errors.append("has no steps")
@@ -291,6 +513,10 @@ def analyze(game, cheat, fmt: str, items: Optional[dict] = None) -> Report:
                     used.add(j)
                     break
         r.lines.append(line)
+    if cave_lines:
+        first = [ln for ln in cave_lines if ln.offset not in hook_sites or not ln.what.startswith("hook ")]
+        jumps = [ln for ln in cave_lines if ln.what.startswith("hook ")]
+        r.lines = [ln for ln in first if not ln.what.startswith("hook ")] + r.lines + jumps
     if not once:
         for j, (s2, o2, _d2, _op2, _e2, what) in enumerate(offs):
             if j not in used:

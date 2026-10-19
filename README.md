@@ -19,7 +19,7 @@
 
 | | |
 | --- | --- |
-| **Scan memory** | Exact, bigger / smaller, between, unknown initial, increased / decreased, changed / unchanged - run on the console (turbo scan); address list with freeze; Cheat Engine-style **pointer scan** |
+| **Scan memory** | Exact, bigger / smaller, between, unknown initial, increased / decreased, changed / unchanged - run on the console (turbo scan); address list with freeze (**Add selected** / **Add all** results, Shift / Ctrl+click / Ctrl+A to pick several); Cheat Engine-style **pointer scan** |
 | **Read & patch** | Hex editor, disassembler with AOB signatures, assemble-in-place, NOP, code caves and hooks |
 | **Debug** | Software and hardware breakpoints, watchpoints, stepping, registers + XMM, call stack that also works through frameless functions, threads |
 | **Call game functions** | Call any function with up to 6 arguments, allocate buffers, write assembly into memory and run it |
@@ -190,9 +190,25 @@ lists and the `exports\` folder. Switch, create or open projects at the top of t
 | `.ShnExt` | AOB finders, hooks, code caves, inputs and item dropdowns (when the private ShnExt module is built in) | onionHEN / ShnExt |
 
 `.shn`, `.mc4` and GoldHEN `.json` can only hold fixed patches of the game executable, so every cheat
-is checked first. Cheats they cannot hold (code caves allocated at run time, hooks, AOB scans,
-pointers, inputs, Python) are listed with the reason and left out - nothing is written half-converted.
+is checked first. Cheats they cannot hold (AOB scans, pointers, function calls, inputs other than in a
+code cave, Python) are listed with the reason and left out - nothing is written half-converted.
 Missing *off* values (the original bytes) can be read straight from the running game.
+
+**Code caves in .shn / .mc4 / GoldHEN .json.** These formats have no memory of their own, so a cheat
+with a hook (and its @buffers) is exported the way hand-made console code caves work: the cave code is
+written into unused bytes of the game executable and the hook site becomes `jmp cave`.
+
+- Give the place in **Code caves** in the export window, or press **Find free space** with the game
+  running. It picks unused CC / 00 padding, preferably at the end of the game's code, and checks an offset
+  you typed.
+- Offsets are the `module(main)+0x...` numbers the tool shows. The .shn `<Offset>` is the same number:
+  nothing to subtract (no `-0x400000`).
+- The cave line's off value is the cave itself, so it stays in place (unused) when the cheat is off; only
+  the hook site is restored. Jumps are relative, so the cheat works wherever the game loads.
+- Buffers the code only reads go next to the code. Buffers it writes need memory the game does not use
+  (the "buffers" field), because code pages are read-only. Inputs used by the cave are fixed at their
+  defaults.
+- A hook found by AOB needs a fixed offset for these formats (untick *Locate by AOB*). ShnExt keeps AOBs.
 
 ### Game names, title ids and versions
 
