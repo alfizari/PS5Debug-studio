@@ -52,8 +52,52 @@ def mono(size: int = 10, *style: str) -> tuple:
     return (MONO_FONT[0], size, *style)
 
 
+def _install_edit_menu(root: tk.Tk) -> None:
+    """A right-click Cut / Copy / Paste / Select all menu on every entry, combobox and text box
+    (addresses, values, the cheat JSON...).  Installed once per class, app-wide."""
+    if getattr(root, "_edit_menu_installed", False):
+        return
+    root._edit_menu_installed = True
+
+    def popup(event):
+        w = event.widget
+        try:
+            editable = str(w.cget("state")) not in ("disabled", "readonly")
+        except tk.TclError:
+            editable = True
+        is_text = w.winfo_class() == "Text"
+        try:
+            w.focus_set()
+        except tk.TclError:
+            return
+        m = tk.Menu(w, tearoff=0)
+        def ev(seq):
+            return lambda: w.event_generate(seq)
+        if editable:
+            m.add_command(label="Cut", command=ev("<<Cut>>"))
+        m.add_command(label="Copy", command=ev("<<Copy>>"))
+        if editable:
+            m.add_command(label="Paste", command=ev("<<Paste>>"))
+        m.add_separator()
+        if is_text:
+            m.add_command(label="Select all",
+                          command=lambda: (w.tag_add("sel", "1.0", "end"), w.mark_set("insert", "1.0")))
+        else:
+            m.add_command(label="Select all", command=ev("<<SelectAll>>"))
+        try:
+            m.tk_popup(event.x_root, event.y_root)
+        finally:
+            m.grab_release()
+        return "break"
+
+    for cls in ("TEntry", "Entry", "TCombobox", "Text", "TSpinbox", "Spinbox"):
+        root.bind_class(cls, "<Button-3>", popup, add="+")
+        root.bind_class(cls, "<Button-2>", popup, add="+")      # mac
+
+
 def apply(root: tk.Tk, which: str = "light") -> None:
     global _current, UI_FONT, MONO_FONT
+    _install_edit_menu(root)
     _current = which if which in PALETTES else "light"
     p = PALETTES[_current]
 

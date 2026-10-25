@@ -275,7 +275,10 @@ def load_games(folder: Path) -> tuple[list[Game], list[str]]:
     games: list[Game] = []
     errors: list[str] = []
     folder.mkdir(parents=True, exist_ok=True)
+    sidecars = {"cavemap.json"}                       # tool records kept beside the game files
     for p in sorted(folder.glob("*.json")):
+        if p.name in sidecars:
+            continue
         try:
             games.append(Game.from_dict(json.loads(p.read_text(encoding="utf-8")), p))
         except Exception as exc:

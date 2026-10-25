@@ -18,6 +18,7 @@ from scrollable import fit_geometry
 
 import cheat_export as ce
 import cheat_pack
+import cave_map
 import game_ids
 
 OWN = {
@@ -105,20 +106,35 @@ class ExportDialog:
         self.head_msg = ttk.Label(hf, text="", foreground="#c0392b", wraplength=900, justify="left")
         self.head_msg.grid(row=2, column=0, columnspan=6, sticky="w", pady=(4, 0))
 
-        # ---- cheats
-        self.lf = lf = ttk.LabelFrame(top, text="Cheats", padding=6)
-        self.tree = ttk.Treeview(lf, columns=("st", "name", "lines", "why"), show="headings", height=10)
-        for col, title, wd, st in (("st", "", 34, False), ("name", "Cheat", 220, False),
-                                   ("lines", "Lines", 50, False), ("why", "Notes", 600, True)):
+        # ---- cheats (tick which ones to export)
+        self.lf = lf = ttk.LabelFrame(top, text="Cheats - tick the ones to export", padding=6)
+        self.picked = set(range(len(self.cheats)))          # cheat indexes to export (all, by default)
+        pickrow = ttk.Frame(lf)
+        pickrow.pack(fill="x")
+        ttk.Button(pickrow, text="All", style="Small.TButton", width=6,
+                   command=lambda: self._pick_set(range(len(self.cheats)))).pack(side="left")
+        ttk.Button(pickrow, text="None", style="Small.TButton", width=6,
+                   command=lambda: self._pick_set(())).pack(side="left", padx=(4, 0))
+        ttk.Button(pickrow, text="Only exportable", style="Small.TButton",
+                   command=self._pick_exportable).pack(side="left", padx=(4, 0))
+        ttk.Label(pickrow, text="Click the box, or Space to toggle", style="Muted.TLabel").pack(side="left", padx=(10, 0))
+        tw = ttk.Frame(lf)
+        tw.pack(fill="both", expand=True, pady=(4, 0))
+        self.tree = ttk.Treeview(tw, columns=("pick", "st", "name", "lines", "why"), show="headings", height=10)
+        for col, title, wd, st in (("pick", "", 30, False), ("st", "", 30, False), ("name", "Cheat", 220, False),
+                                   ("lines", "Lines", 50, False), ("why", "Notes", 580, True)):
             self.tree.heading(col, text=title)
-            self.tree.column(col, width=wd, stretch=st, anchor="center" if col in ("st", "lines") else "w")
-        sb = ttk.Scrollbar(lf, orient="vertical", command=self.tree.yview)
+            self.tree.column(col, width=wd, stretch=st, anchor="center" if col in ("pick", "st", "lines") else "w")
+        sb = ttk.Scrollbar(tw, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=sb.set)
         self.tree.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
         self.tree.tag_configure("bad", foreground="#c0392b")
         self.tree.tag_configure("need", foreground="#b9770e")
+        self.tree.tag_configure("off", foreground="#9aa0a6")      # not ticked
         self.tree.bind("<Double-1>", self._show_detail)
+        self.tree.bind("<Button-1>", self._tree_click, add="+")
+        self.tree.bind("<space>", self._toggle_selected)
 
         # ---- original bytes
         self.of = of = ttk.Frame(top)
@@ -148,8 +164,18 @@ class ExportDialog:
             "Offset is the same number). Buffers the code only reads go next to the code; buffers it writes "
             "need memory the game does not use (code pages are read-only).")).grid(
             row=2, column=0, columnspan=6, sticky="w", pady=(2, 0))
+        resrow = ttk.Frame(cf)
+        resrow.grid(row=3, column=0, columnspan=6, sticky="w", pady=(4, 0))
+        self.reserved_var = tk.StringVar(value="")
+        ttk.Label(resrow, textvariable=self.reserved_var, foreground="#7f8c8d").pack(side="left")
+        ttk.Button(resrow, text="Manage used space…", style="Small.TButton",
+                   command=self._manage_caves).pack(side="left", padx=(8, 0))
+        self.record_caves = tk.BooleanVar(value=True)
+        ttk.Checkbutton(resrow, text="Record the space used after export (avoids overlap next time)",
+                        variable=self.record_caves).pack(side="left", padx=(12, 0))
         for v in (self.cave_code, self.cave_data):
             v.trace_add("write", lambda *_: self._cave_edited())
+        self._refresh_reserved()
 
         # ---- buttons
         bf = ttk.Frame(top)
@@ -229,7 +255,7 @@ class ExportDialog:
             self.of.pack(side="bottom", fill="x", pady=(6, 0))
             if caves:
                 self.cf.pack(side="bottom", fill="x", pady=(6, 0))
-            self.lf.pack(fill="both", expand=True, pady=(8, 0))
+        self.lf.pack(fill="both", expand=True, pady=(8, 0))   # tick-which-to-export: shown for every format
         plan = self._cave_plan() if caves else None
         hg = self._hdr_game()
         self.reports = [] if own else [ce.analyze(hg, c, fmt, self._items(), cave=plan) for c in self.cheats]
@@ -249,23 +275,28 @@ class ExportDialog:
 
     def _refresh(self) -> None:
         fmt = self.fmt.get()
+        self.tree.delete(*self.tree.get_children())
         if fmt in OWN:
             lists = sorted({p.get("items") for c in self.cheats for p in c.params if p.get("items")})
             have = [x for x in lists if self.app.items is not None and self.app.items.items(x)]
             missing = [x for x in lists if x not in have]
-            txt = f"{len(self.cheats)} cheat(s) - this tool's own format keeps every step"
-            if have:
-                txt += f" \u00b7 includes {len(have)} item ID list(s): {', '.join(have)}"
-            if missing:
-                txt += f" \u00b7 \u26a0 item list(s) not found in this project: {', '.join(missing)}"
+            for i, c in enumerate(self.cheats):
+                picked = i in self.picked
+                self.tree.insert("", "end", iid=str(i), tags=() if picked else ("off",),
+                                 values=(self._box(picked), "✔", c.name, "", "keeps every step"))
             errs, warns = ce.check_game(self._hdr_game(), fmt)
             self._show_head(errs, warns)
+            n = len(self.picked)
+            txt = f"{n} of {len(self.cheats)} cheat(s) ticked - this tool's own format keeps every step"
+            if have:
+                txt += f" \u00b7 item ID list(s): {', '.join(have)}"
+            if missing:
+                txt += f" \u00b7 \u26a0 item list(s) not found: {', '.join(missing)}"
             self.summary.configure(text=txt)
-            self.go.configure(text=f"Export {len(self.cheats)} cheat(s)...", state="disabled" if errs else "normal")
+            self.go.configure(text=f"Export {n} cheat(s)...", state="disabled" if (errs or not n) else "normal")
             return
         errs, warns = ce.check_game(self._hdr_game(), fmt)
         self._show_head(errs, warns)
-        self.tree.delete(*self.tree.get_children())
         need = 0
         for i, r in enumerate(self.reports):
             if r.errors:
@@ -279,14 +310,18 @@ class ExportDialog:
                 st, tag, why = "✔", "", "; ".join(r.warnings) or "ok"
             if getattr(r, "summary", ""):
                 why = f"{why}  -  {r.summary}" if why != "ok" else f"ok  -  {r.summary}"
-            self.tree.insert("", "end", iid=str(i), values=(st, r.cheat.name, len(r.lines) or "", why), tags=(tag,))
-        ok = sum(1 for r in self.reports if r.ok)
-        bad = sum(1 for r in self.reports if r.errors)
-        parts = [f"{ok} of {len(self.reports)} cheat(s) can be exported"]
-        if need:
-            parts.append(f"{need} need original bytes")
-        if bad:
-            parts.append(f"{bad} cannot be written as {ce.FORMATS[fmt][1]} (double-click for why)")
+            picked = i in self.picked
+            self.tree.insert("", "end", iid=str(i),
+                             values=(self._box(picked), st, r.cheat.name, len(r.lines) or "", why),
+                             tags=(tag,) if picked else ("off",))
+        ok = sum(1 for i, r in enumerate(self.reports) if r.ok and i in self.picked)
+        skip_bad = sum(1 for i, r in enumerate(self.reports) if r.errors and i in self.picked)
+        need_pick = sum(1 for i, r in enumerate(self.reports) if r.missing_off() and i in self.picked)
+        parts = [f"{ok} ticked cheat(s) ready to export"]
+        if need_pick:
+            parts.append(f"{need_pick} ticked need original bytes")
+        if skip_bad:
+            parts.append(f"{skip_bad} ticked cannot be written as {ce.FORMATS[fmt][1]} (double-click for why)")
         self.summary.configure(text=" · ".join(parts))
         self.go.configure(text=f"Export {ok} cheat(s)...", state="normal" if ok and not errs else "disabled")
         connected = bool(getattr(self.app.client, "connected", False))
@@ -330,6 +365,64 @@ class ExportDialog:
 
     _job_cave = None
 
+    # --------------------------------------------- record of cave space used (cave_map)
+    def _reserved(self):
+        g = self._hdr_game()
+        return cave_map.regions(self.store.folder, g.title_id, g.version)
+
+    def _refresh_reserved(self) -> None:
+        n = len(self._reserved())
+        self.reserved_var.set(f"{n} region(s) already used by earlier exports" if n
+                              else "no cave space recorded yet for this game")
+
+    def _manage_caves(self) -> None:
+        g = self._hdr_game()
+        rows = self._reserved()
+        win = tk.Toplevel(self.win)
+        win.title(f"Code cave space used - {g.title_id} v{g.version}")
+        fit_geometry(win, 560, 320)
+        ttk.Label(win, padding=8, wraplength=540, justify="left", text=(
+            "Regions of the game executable earlier exports placed caves in. 'Find free space' avoids these. "
+            "Remove one to let the space be reused.")).pack(fill="x")
+        tv = ttk.Treeview(win, columns=("off", "len", "label"), show="headings", height=9)
+        for c, t, w in (("off", "module(main)+0x", 140), ("len", "Bytes", 70), ("label", "From", 320)):
+            tv.heading(c, text=t)
+            tv.column(c, width=w, anchor="w")
+        tv.pack(fill="both", expand=True, padx=8)
+        def fill():
+            tv.delete(*tv.get_children())
+            for off, ln, lbl in cave_map.regions(self.store.folder, g.title_id, g.version):
+                tv.insert("", "end", iid=str(off), values=(f"{off:X}", ln, lbl))
+        fill()
+        bar = ttk.Frame(win, padding=8)
+        bar.pack(fill="x")
+        def rm():
+            for iid in tv.selection():
+                cave_map.remove(self.store.folder, g.title_id, g.version, int(iid))
+            fill(); self._refresh_reserved(); self._changed()
+        def clear_all():
+            if messagebox.askyesno("Clear", "Forget all recorded cave space for this game?", parent=win):
+                cave_map.clear(self.store.folder, g.title_id, g.version)
+                fill(); self._refresh_reserved(); self._changed()
+        ttk.Button(bar, text="Remove selected", command=rm).pack(side="left")
+        ttk.Button(bar, text="Clear all", command=clear_all).pack(side="left", padx=6)
+        ttk.Button(bar, text="Close", command=win.destroy).pack(side="right")
+
+    def _reserve_used(self, fname: str) -> None:
+        """After an export, remember the executable space the caves took, so the next export avoids it."""
+        plan = getattr(self, "_plan", None)
+        if not (plan and getattr(self, "record_caves", None) and self.record_caves.get()):
+            return
+        g = self._hdr_game()
+        picked_names = [self.reports[i].cheat.name for i in sorted(self.picked)
+                        if i < len(self.reports) and self.reports[i].ok]
+        label = f"{', '.join(picked_names[:2])}{'...' if len(picked_names) > 2 else ''} ({fname})"
+        if plan.code_off is not None and plan.used_code:
+            cave_map.reserve(self.store.folder, g.title_id, g.version, plan.code_off, plan.used_code, label)
+        if plan.data_off is not None and plan.used_data:
+            cave_map.reserve(self.store.folder, g.title_id, g.version, plan.data_off, plan.used_data, label + " [data]")
+        self._refresh_reserved()
+
     def _cave_need(self) -> int:
         """bytes the caves of the selected cheats take (assembled at a trial offset)"""
         plan = ce.CavePlan(code_off=0, data_off=0x10000000)
@@ -358,6 +451,8 @@ class ExportDialog:
         def post(fn):
             app.root.after(0, lambda: self.win.winfo_exists() and fn())
 
+        reserved_off = self._reserved()                     # (off, len, label) from earlier exports
+
         def work() -> None:
             maps = client.maps(pid)
             exe = [m for m in maps if m.prot & 4]
@@ -365,31 +460,37 @@ class ExportDialog:
                 raise RuntimeError("the game has no executable mapping")
             main = min(exe, key=lambda m: m.start)
             base = main.start
+            reserved_abs = [(base + o, n, l) for o, n, l in reserved_off]
             code_maps = sorted((m for m in exe if m.name == main.name), key=lambda m: m.start)
+            relocate = ""
             if typed is not None:
                 at = base + typed
                 m = next((m for m in code_maps if m.start <= at < m.end), None)
                 if m is None:
                     post(lambda: self.cave_msg.configure(
-                        text=f"✖ +0x{typed:X} is not in the game's code (it must be executable memory)",
-                        foreground="#c0392b"))
-                    return
-                n = min(need, m.end - at)
-                b = client.read(pid, at, n)
-                ok = n == need and all(x in (0x00, 0xCC) for x in b)
-                free = 0
-                if ok:
-                    chunk = client.read(pid, at, min(m.end - at, 0x10000))
-                    fb = chunk[0]
-                    free = next((i for i, x in enumerate(chunk) if x != fb), len(chunk))
-                    self._cave_free[typed] = free
-                pad = "CC" if b[:1] == b"\xcc" else "00"
-                msg = (f"✔ +0x{typed:X}: {free} free bytes ({pad} padding), the caves "
-                       f"need {need}") if ok else (f"✖ +0x{typed:X} is not free: the {need} bytes there are not all 00 / CC "
-                                                    "- clear the field and press Find free space")
-                post(lambda: (self.cave_msg.configure(text=msg, foreground="#1e8449" if ok else "#c0392b"),
-                              self._changed()))
-                return
+                        text=f"✖ +0x{typed:X} is not in the game's code - searching for free space instead...",
+                        foreground="#b9770e"))
+                    relocate = f"+0x{typed:X} is not in the game's code"
+                else:
+                    n = min(need, m.end - at)
+                    b = client.read(pid, at, n)
+                    clash = next((l for ro, rn, l in reserved_abs if at < ro + rn and ro < at + need), None)
+                    if n == need and all(x in (0x00, 0xCC) for x in b) and clash is None:
+                        chunk = client.read(pid, at, min(m.end - at, 0x10000))
+                        fb = chunk[0]
+                        free = next((i for i, x in enumerate(chunk) if x != fb), len(chunk))
+                        for ro, rn, _l in reserved_abs:                    # stop the count at a reserved region
+                            if at < ro:
+                                free = min(free, ro - at)
+                        self._cave_free[typed] = free
+                        pad = "CC" if b[:1] == b"\xcc" else "00"
+                        post(lambda f=free, pd=pad: (self.cave_msg.configure(
+                            text=f"✔ +0x{typed:X}: {f} free bytes ({pd} padding), the caves need {need}",
+                            foreground="#1e8449"), self._changed()))
+                        return
+                    relocate = (f"+0x{typed:X} overlaps space used by '{clash}'" if clash
+                                else f"+0x{typed:X} is not free")
+                # the typed offset is not usable -> fall through and find a clear spot automatically
             best = None                               # (kind, length, start, byte)
             for m in code_maps:
                 def chunks(m=m):
@@ -405,9 +506,13 @@ class ExportDialog:
                             text=f"Reading the game's code... {100 * (p - m.start) // max(1, m.end - m.start)}% "
                                  f"of {m.name}", foreground="#7f8c8d"))
                 for start, length, byte in padding_runs(chunks(), 64):
-                    kind = 2 if start + length == m.end else (1 if byte == 0xCC else 0)
-                    if best is None or (length >= need, kind, length) > (best[1] >= need, best[0], best[1]):
-                        best = (kind, length, start, byte)
+                    run_end = start + length
+                    for fstart, flen in cave_map.subtract(start, length, reserved_abs):
+                        if flen < 64:
+                            continue
+                        kind = 2 if fstart + flen == m.end else (1 if byte == 0xCC else 0)
+                        if best is None or (flen >= need, kind, flen) > (best[1] >= need, best[0], best[1]):
+                            best = (kind, flen, fstart, byte)
             if best is None:
                 post(lambda: self.cave_msg.configure(text="✖ no free 00 / CC space of 64+ bytes in the game's code",
                                                      foreground="#c0392b"))
@@ -421,13 +526,49 @@ class ExportDialog:
                 self.cave_code.set(f"{off:X}")
                 what = {2: "at the end of the code", 1: "int3 (CC) padding", 0: "zero padding inside the code"}[kind]
                 warn = "" if kind else "  ⚠ zeros inside the code can be data - prefer CC / end-of-code space"
+                moved = f"{relocate} - moved to  " if relocate else ""
                 ok = free >= need
                 self.cave_msg.configure(
-                    text=f"{'✔' if ok else '✖'} free space +0x{off:X}: {free} bytes ({what}), the caves need {need}{warn}",
+                    text=f"{'✔' if ok else '✖'} {moved}free space +0x{off:X}: {free} bytes ({what}), "
+                         f"the caves need {need}{warn}",
                     foreground="#1e8449" if ok and kind else ("#b9770e" if ok else "#c0392b"))
             post(done)
 
         app._run_bg(work, "Looking for free space in the game's code...")
+
+    # ------------------------------------------------------------- pick which cheats
+    def _pick_set(self, idxs):
+        self.picked = set(int(i) for i in idxs)
+        self._refresh()
+
+    def _pick_exportable(self):
+        if self.fmt.get() in OWN:
+            self.picked = set(range(len(self.cheats)))
+        else:
+            self.picked = {i for i, r in enumerate(self.reports) if r.ok}
+        self._refresh()
+
+    def _toggle(self, i):
+        self.picked.discard(i) if i in self.picked else self.picked.add(i)
+        self._refresh()
+
+    def _tree_click(self, e):
+        if self.tree.identify_region(e.x, e.y) != "cell" or self.tree.identify_column(e.x) != "#1":
+            return
+        iid = self.tree.identify_row(e.y)
+        if iid != "":
+            self._toggle(int(iid))
+            return "break"
+
+    def _toggle_selected(self, _e=None):
+        for iid in self.tree.selection():
+            self.picked.discard(int(iid)) if int(iid) in self.picked else self.picked.add(int(iid))
+        self._refresh()
+        return "break"
+
+    @staticmethod
+    def _box(on):
+        return "☑" if on else "☐"
 
     def _show_detail(self, _e=None) -> None:
         sel = self.tree.selection()
@@ -502,29 +643,32 @@ class ExportDialog:
             g = self._hdr_game()
             if ce.check_game(g, fmt)[0]:
                 return
+            picked = [self.cheats[i] for i in sorted(self.picked)]
+            if not picked:
+                return
             ext = OWN[fmt][1]
             name = game_ids.file_stem(g.title_id, g.version, g.name) + (
-                "" if len(self.cheats) == len(self.game.cheats) else "_" + cheat_pack._slug(self.cheats[0].name))
+                "" if len(picked) == len(self.game.cheats) else "_" + cheat_pack._slug(picked[0].name))
             path = filedialog.asksaveasfilename(parent=self.win, title="Export cheats", defaultextension=ext,
                                                 initialdir=self._exports_dir(),
                                                 initialfile=name + ext, filetypes=[(OWN[fmt][0], "*" + ext)])
             if not path:
                 return
-            pack = cheat_pack.build_pack([(g, self.cheats)], self.app.items)
+            pack = cheat_pack.build_pack([(g, picked)], self.app.items)
             if fmt == "pack_json":
                 Path(path).write_text(json.dumps(pack, indent=2, ensure_ascii=False), encoding="utf-8")
             else:
                 Path(path).write_bytes(cheat_pack.to_file_bytes(pack))
-            self.app.log_line(f"exported {len(self.cheats)} cheat(s) of {g.name} "
+            self.app.log_line(f"exported {len(picked)} cheat(s) of {g.name} "
                               f"(+{len(pack['items'])} item list(s)) to {path}")
             self.win.destroy()
             return
         hg = self._hdr_game()
         errs, _w = ce.check_game(hg, fmt)
-        ok = [r for r in self.reports if r.ok]
+        ok = [r for i, r in enumerate(self.reports) if r.ok and i in self.picked]
         if errs or not ok:
             return
-        skipped = [r.cheat.name for r in self.reports if not r.ok]
+        skipped = [r.cheat.name for i, r in enumerate(self.reports) if i in self.picked and not r.ok]
         if skipped and not messagebox.askokcancel(
                 "Export", f"{len(skipped)} cheat(s) are left out (they cannot be written as {ce.FORMATS[fmt][1]}):\n\n"
                 + "\n".join(skipped[:15]) + ("\n..." if len(skipped) > 15 else "") +
@@ -545,8 +689,10 @@ class ExportDialog:
             messagebox.showerror("Export", f"Could not build the {ext} file:\n\n{exc}", parent=self.win)
             return
         Path(path).write_bytes(data)
+        if getattr(self, "_plan", None) is not None and (self._plan.used_code or self._plan.used_data):
+            self._reserve_used(Path(path).name)         # remember the executable space the caves took
         want = ce.default_name(hg, fmt)
         note = "" if Path(path).name == want else f"  (cheat menus expect the name {want})"
-        self.app.log_line(f"exported {len(ok)} cheat(s) of {g.name} as {ext} to {path}"
+        self.app.log_line(f"exported {len(ok)} cheat(s) of {hg.name} as {ext} to {path}"
                           + (f", left out {len(skipped)}" if skipped else "") + note)
         self.win.destroy()

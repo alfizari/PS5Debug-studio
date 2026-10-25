@@ -91,7 +91,8 @@ dump a region to a file.
 
 capstone disassembly with back/forward navigation, AOB scan and *Make AOB from selected line*. Right
 click to set breakpoints, NOP, patch bytes, assemble in place, build a code cave, log calls or find
-references.
+references. **Make cheat → Cheat Editor** turns the selected instruction straight into a cheat
+(NOP, patch bytes or assemble) at `module(name)+0x…`, added to the open cheat or a new one.
 
 <img src="pics/disassembler%20tab.png" alt="Disassembler" width="49%"> <img src="pics/disassembler%20tab%20right%20click.png" alt="Disassembler menu" width="49%">
 
@@ -158,7 +159,8 @@ The **Cheats** tab lists your games and their cheats - one row each with On/Off 
 
 ### Making cheats
 
-The **Cheat Editor** edits cheat files (JSON, one per game). A cheat is a list of steps:
+The **Cheat Editor** edits cheat files (JSON, one per game). Right-click a game or cheat for New /
+Duplicate / Rename / Enable / Export / Delete. A cheat is a list of steps:
 
 ```json
 {
@@ -209,6 +211,12 @@ written into unused bytes of the game executable and the hook site becomes `jmp 
   (the "buffers" field), because code pages are read-only. Inputs used by the cave are fixed at their
   defaults.
 - A hook found by AOB needs a fixed offset for these formats (untick *Locate by AOB*). ShnExt keeps AOBs.
+- **The space each export uses is recorded** (per game + version, in `cheats/cavemap.json`). The next
+  export's **Find free space** skips it, so two cave cheats never land on top of each other. **Manage
+  used space** lists the recorded regions and lets you free one.
+
+**Choosing which cheats to export.** The export window lists every cheat with a tick box; untick the
+ones you don't want, or use **All / None / Only exportable**. Only ticked cheats are written.
 
 ### Game names, title ids and versions
 
@@ -228,6 +236,11 @@ or imported: lower-case ids, ids found in the name or content id, versions like 
 written in full, an empty process set to `eboot.bin`. The untouched original of a library file is
 kept in `deleted\<name>_before_naming.json`. Cheats for different versions of a game are never merged
 into one file, and turning on a cheat made for another version writes a warning to the log.
+
+### Cheat Player
+
+`cheat_player/` is a separate, simpler app that only plays cheats (no scanner or debugger) for people
+who just want to use cheats. Build it with `cheat_player\build_player.bat`.
 
 ## Building the .exe
 
@@ -265,7 +278,7 @@ the icon, and on the first build copies your `cheats`, `tables`, `scripts`, `poi
 The tool works with the stock ps5debug-NG payload. One extra command, **pointer-scan level
 (`0xBDAACC30`)**, makes pointer scans run on the console; it is submitted upstream as a pull request.
 Until a payload has it, the tool detects that it is missing (CAPS bit `TSE_POINTER_SCAN`) and uses
-turbo scans instead. or use the payload on https://github.com/alfizari/ps5debug-NG
+turbo scans instead.
 
 ## Credits
 

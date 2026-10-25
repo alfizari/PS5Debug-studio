@@ -308,12 +308,83 @@ class DisassemblerTab:
             a, orig = self.patches[-1]
             items.append((f"Undo last patch (0x{a:X}, {len(orig)} bytes)", self._undo_patch))
         items.append(self._cave_menu_item(ins))
+        items.append(None)
+        items.append(("Make cheat: NOP here → Cheat Editor", lambda: self._make_cheat(ins, "nop")))
+        items.append(("Make cheat: patch bytes → Cheat Editor…", lambda: self._make_cheat(ins, "bytes")))
+        items.append(("Make cheat: assemble here → Cheat Editor…", lambda: self._make_cheat(ins, "asm")))
+        items.append(None)
         items.append(("Log calls to this function (no breakpoint)…", lambda: self.app.open_func_logger(ins.addr)))
         items.append(None)
         items.append(("Find references to this address", lambda: self._find_xrefs(ins.addr)))
         items.append(("Make AOB signature here", lambda: (self.view.select(ins.addr), self.on_aob_make())))
         items.append(("Open in hex editor", lambda: self.app._hex_goto_value(ins.addr, 0x100)))
         return items
+
+    # ----------------------------------------------- make a direct code cheat -> Cheat Editor
+    def _make_cheat(self, ins: Insn, kind: str) -> None:
+        """Build a patch / asmpatch step for this instruction and send it to the Cheat Editor.
+        The address is written as module(name)+0x so the cheat is portable and exports cleanly."""
+        editor = getattr(self.app, "cheats_editor", None)
+        if editor is None:
+            self.app.log_line("the Cheat Editor is not available")
+            return
+        if kind == "bytes":
+            text = simpledialog.askstring("Make cheat: patch bytes",
+                                          f"Hex bytes to write at 0x{ins.addr:X}:",
+                                          initialvalue=ins.hexbytes(), parent=self.app.root)
+            if not text:
+                return
+            digits = re.sub(r"[^0-9a-fA-F]", "", text)
+            if not digits or len(digits) % 2:
+                messagebox.showerror("Make cheat", "Enter an even number of hex digits, e.g. 90 90 90")
+                return
+            payload = bytes.fromhex(digits)
+        elif kind == "asm":
+            text = simpledialog.askstring(
+                "Make cheat: assemble here",
+                f"Assembly at 0x{ins.addr:X}  (separate instructions with ; - @buf0 / module(x) allowed):",
+                initialvalue=ins.text if ins.text and not ins.text.startswith("(") else "",
+                parent=self.app.root)
+            if not text:
+                return
+            payload = text
+        else:                                           # nop
+            payload = b"\x90" * ins.size
+
+        try:
+            pid = self.app._pid()
+        except Exception as exc:
+            self.app._fail(exc)
+            return
+        addr = ins.addr
+        app = self.app
+
+        def work() -> None:
+            maps = getattr(app, "_maps_cache", None) or app.client.maps(pid)
+            app._maps_cache = maps
+            expr = codecave.symbolize(maps, addr)        # module(name)+0x.... or 0x.... if unmapped
+
+            def ui() -> None:
+                if kind == "asm":
+                    try:
+                        data = asmgen.assemble(asmgen.substitute(str(payload).replace(";", "\n"), app.eval_full), addr)
+                    except Exception as exc:
+                        messagebox.showerror("Make cheat", str(exc))
+                        return
+                    if len(data) > ins.size and not messagebox.askyesno(
+                            "Make cheat", f"The new code is {len(data)} bytes but the instruction is {ins.size}. "
+                            f"It will overwrite {len(data) - ins.size} byte(s) of the following instruction(s). "
+                            "Add it anyway?"):
+                        return
+                    step = {"op": "asmpatch", "addr": expr, "asm": str(payload).replace(";", "\n")}
+                    label = f"Code {expr}"
+                else:
+                    step = {"op": "patch", "addr": expr, "type": "hex", "value": payload.hex(" ").upper()}
+                    label = ("NOP " if kind == "nop" else "Patch ") + expr
+                editor.send_steps([step], suggested_name=label)
+            app.root.after(0, ui)
+
+        app._run_bg(work, "Resolving the address...")
 
     # ----------------------------------------------------------- code cave
     def _cave_menu_item(self, ins: Insn) -> tuple:

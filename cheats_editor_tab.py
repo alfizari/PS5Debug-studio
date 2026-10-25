@@ -192,6 +192,7 @@ class CheatsEditorTab:
         self.tree.pack(fill="both", expand=True, pady=4)
         self.tree.bind("<<TreeviewSelect>>", self._on_select)
         self.tree.bind("<Double-1>", self._on_double)
+        self.tree.bind("<Button-3>", self._tree_menu)
         self.tree.bind("<<TreeviewOpen>>", lambda _e: self._remember_open(True))
         self.tree.bind("<<TreeviewClose>>", lambda _e: self._remember_open(False))
 
@@ -630,6 +631,51 @@ class CheatsEditorTab:
         self._put_cheat(d, cheat_tools.add_steps(d, [step]))
         return True
 
+    def send_steps(self, steps: list, params: list = (), suggested_name: str = "New cheat",
+                   switch: bool = True) -> bool:
+        """Add step(s) from elsewhere (disassembler, scanner...) to a cheat.  If a cheat is open it
+        offers to add to it or make a new one; otherwise it makes a new cheat in the selected game."""
+        if switch and hasattr(self.app, "notebook") and hasattr(self.app, "_cheats_editor_tab"):
+            self.app.notebook.select(self.app._cheats_editor_tab)
+        sel = self.cur or self._selection()
+        game = sel[0] if sel else None
+        if game is None:
+            messagebox.showerror("Cheats", "Select the game (or a cheat) in the Cheat Editor to add this to, "
+                                 "or press New game first.")
+            return False
+        open_ci = self.cur[1] if (self.cur and self.cur[0] is game) else None
+        if open_ci is not None and 0 <= open_ci < len(game.cheats):
+            ans = messagebox.askyesnocancel(
+                "Send to Cheat Editor",
+                f"Add {len(steps)} step(s) to the open cheat '{game.cheats[open_ci].name}'?\n\n"
+                "Yes = add to it      No = make a new cheat")
+            if ans is None:
+                return False
+            if ans:
+                return self.insert_steps(steps, params)
+        base = suggested_name.strip() or "New cheat"
+        name, n = base, 1
+        while any(x.name == name for x in game.cheats):
+            n += 1
+            name = f"{base} {n}"
+        try:
+            c = Cheat.from_dict({"name": name, "mode": "toggle",
+                                 "author": self.app.author() if hasattr(self.app, "author") else "",
+                                 "params": list(params), "steps": list(steps)})
+        except Exception as exc:
+            messagebox.showerror("Cheats", f"Could not make the cheat: {exc}")
+            return False
+        game.cheats.append(c)
+        try:
+            game.save()
+        except Exception as exc:
+            messagebox.showerror("Cheats", f"Not saved: {exc}")
+            return False
+        self.reload()
+        self._fill(select=self.store.key(game, c))
+        self.app.log_line(f"cheat editor: new cheat '{name}' ({len(steps)} step(s)) in {game.name}")
+        return True
+
     def insert_steps(self, steps: list, params: list = ()) -> bool:
         """Add several steps (and the inputs they use) to the open cheat in one edit."""
         d = self._need_cheat()
@@ -1006,6 +1052,100 @@ class CheatsEditorTab:
         self._fill(select=self.store.key(game, c))
         self.app.log_line(f"cheat editor: new cheat '{name}' in {game.name}")
         return None
+
+    def _tree_menu(self, event) -> None:
+        iid = self.tree.identify_row(event.y)
+        if iid:
+            self.tree.selection_set(iid)
+            self.tree.focus(iid)
+        sel = self._selection()
+        m = tk.Menu(self.app.root, tearoff=0)
+        if not sel:
+            m.add_command(label="New game…", command=self.on_new_game)
+            m.add_command(label="Reload", command=self.reload)
+            m.tk_popup(event.x_root, event.y_root)
+            return
+        game, ci = sel
+        if ci is None:                                   # a game row
+            m.add_command(label="New cheat", command=self.on_new_cheat)
+            m.add_command(label="New game…", command=self.on_new_game)
+            m.add_separator()
+            m.add_command(label="Export this game…", command=self.on_export)
+            m.add_command(label="Copy as share code", command=self.on_copy_code)
+            m.add_command(label="Show project folder", command=self.on_show_project)
+            m.add_separator()
+            m.add_command(label="Delete game…", command=self.on_delete_game)
+        else:                                            # a cheat row
+            c = game.cheats[ci]
+            on = self.store.is_enabled(game, c)
+            m.add_command(label="Disable" if on else "Enable (Run / Toggle)", command=self.on_run)
+            m.add_separator()
+            m.add_command(label="New cheat", command=self.on_new_cheat)
+            m.add_command(label="Duplicate cheat", command=self._duplicate_cheat)
+            m.add_command(label="Rename…", command=self._rename_cheat)
+            has_hook = any(isinstance(s, dict) and str(s.get("op", "")).lower() == "hook" for s in c.steps)
+            if has_hook:
+                m.add_command(label="Edit code cave…", command=self._edit_cave_cheat)
+            m.add_separator()
+            m.add_command(label="Export this cheat…", command=self.on_export)
+            m.add_command(label="Copy as share code", command=self.on_copy_code)
+            m.add_separator()
+            m.add_command(label="Delete cheat…", command=self.on_delete)
+        m.tk_popup(event.x_root, event.y_root)
+
+    def _duplicate_cheat(self) -> None:
+        sel = self._selection()
+        if not sel or sel[1] is None:
+            return
+        game, ci = sel
+        d = game.cheats[ci].to_dict()
+        base = d["name"] + " (copy)"
+        name, n = base, 1
+        while any(x.name == name for x in game.cheats):
+            n += 1
+            name = f"{base} {n}"
+        d["name"] = name
+        game.cheats.insert(ci + 1, Cheat.from_dict(d))
+        game.save()
+        self._fill(select=self.store.key(game, game.cheats[ci + 1]))
+        self.app.log_line(f"duplicated cheat as '{name}'")
+
+    def _rename_cheat(self) -> None:
+        sel = self._selection()
+        if not sel or sel[1] is None:
+            return
+        game, c = sel[0], sel[0].cheats[sel[1]]
+        new = simpledialog.askstring("Rename cheat", "New name:", initialvalue=c.name, parent=self.app.root)
+        if not new or new.strip() == c.name:
+            return
+        new = new.strip()
+        if any(x.name == new for x in game.cheats):
+            messagebox.showerror("Rename", f"'{new}' already exists in this game.")
+            return
+        was_on = self.store.is_enabled(game, c)
+        self.store.enabled.discard(self.store.key(game, c))
+        c.name = new
+        game.save()
+        if was_on:
+            self.store.enabled.add(self.store.key(game, c))
+        self._fill(select=self.store.key(game, c))
+        self.app.log_line(f"renamed cheat to '{new}'")
+
+    def _edit_cave_cheat(self) -> None:
+        """Re-open a saved hook cheat's cave in the code-cave editor (edit its code / where it goes)."""
+        sel = self._selection()
+        if not sel or sel[1] is None:
+            return
+        game, c = sel[0], sel[0].cheats[sel[1]]
+        hook = next((s for s in c.steps if isinstance(s, dict) and str(s.get("op", "")).lower() == "hook"), None)
+        if hook is None:
+            return
+        messagebox.showinfo("Edit code cave",
+                            "This cheat hooks at:\n  " + str(hook.get("addr")) +
+                            "\n\nTo change the cave code, edit the \"asm\" of its hook step in the JSON on the "
+                            "right, then press Save edits.  To re-record it live, open the address in the "
+                            "Disassembler and choose Code cave.  (Where a cave lands in the executable on export "
+                            "is chosen in the Export window's Code caves box.)")
 
     def on_new_cheat(self) -> None:
         sel = self._selection()
