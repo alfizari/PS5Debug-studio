@@ -99,7 +99,7 @@ class DisassemblerTab:
         if not text:
             return
         try:
-            addr = self.app.eval_full(text)
+            addr = self.app.eval_addr(text)
         except Exception as exc:
             self.app._fail(exc)
             return

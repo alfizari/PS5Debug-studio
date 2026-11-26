@@ -344,9 +344,16 @@ class DebuggerTab:
         return {b["addr"] for b in self.bps if b["kind"] == "bp" and b["enabled"]}
 
     def bp_overrides(self) -> dict[int, int]:
-        """addr -> original byte for breakpoints currently patched into memory."""
-        return {b["addr"]: b["orig"] for b in self.bps
-                if b["kind"] == "bp" and b["applied"] and b["enabled"] and b["orig"] is not None}
+        """addr -> original byte for every int3 currently patched into memory.  That includes breakpoints
+        switched off while stopped (their disarm waits for the next resume, so the 0xCC is still there) and
+        the temporary breakpoint of step over / step out / run to cursor.  Leaving one out made the code view
+        show 'int3' and decode the bytes after it out of step, so lines there had wrong addresses."""
+        out: dict[int, int] = {}
+        tmp = self._temp["b"] if self._temp else None
+        for b in [*self.bps, *self._to_disarm, *([tmp] if tmp else [])]:
+            if b["kind"] == "bp" and b["applied"] and b["orig"] is not None:
+                out[b["addr"]] = b["orig"]
+        return out
 
     def _when_idle(self, fn: Callable[[], None]) -> None:
         if self.app._busy:
@@ -666,7 +673,7 @@ class DebuggerTab:
 
         def ok() -> None:
             try:
-                a = self.app.eval_full(addr_v.get())
+                a = self.app.eval_addr(addr_v.get())
             except Exception as exc:
                 messagebox.showerror("Breakpoint", str(exc), parent=win)
                 return
@@ -918,7 +925,12 @@ class DebuggerTab:
             slot = next((s for s in self.RUN_SLOTS if s not in busy), None)
             if slot is None:
                 raise RuntimeError("temporary breakpoint slots are busy - press Continue once, then retry")
-            tb = {"kind": "bp", "slot": slot, "addr": addr, "enabled": True, "hits": 0, "applied": False, "orig": None}
+            try:
+                orig: Optional[int] = self.client.read(self.pid, addr, 1)[0]
+            except Exception as exc:
+                raise RuntimeError(f"cannot read 0x{addr:X} to place the temporary breakpoint: {exc}") from exc
+            tb = {"kind": "bp", "slot": slot, "addr": addr, "enabled": True, "hits": 0, "applied": False,
+                  "orig": None if orig == 0xCC else orig}
             self._apply(tb)
         self._temp = {"b": tb, "addr": addr, "min_rsp": min_rsp, "done": False}
         self._resume_locked()
@@ -1071,6 +1083,7 @@ class DebuggerTab:
         if hit:
             hit["hits"] += 1
             notes.append(f"breakpoint #{hit['slot']} hit")
+        data_hit = False
         if evt.dr6 & 0xF:
             for i in range(4):
                 if evt.dr6 & (1 << i):
@@ -1078,6 +1091,7 @@ class DebuggerTab:
                     if w:
                         w["hits"] += 1
                         notes.append(f"watchpoint {i} on 0x{w['addr']:X}")
+                        data_hit = data_hit or w.get("wtype") != "exec"
         if evt.signal not in (5, 17):
             notes.append(evt.signame)
         self._notes = notes
@@ -1100,10 +1114,20 @@ class DebuggerTab:
             except Exception as exc:
                 self._code_cache = []
                 root.after(0, lambda e=exc: self.app.log_line(f"debugger: cannot disassemble at RIP: {e}"))
+        # A data watchpoint (write / read-write) is a trap: the CPU stops AFTER the instruction that touched
+        # the memory, so RIP is the next instruction.  Point at the one that did the access instead.
+        accessor = None
+        if data_hit:
+            accessor = next((i for i in insns if i.addr + i.size == rip), None)
+            if accessor is not None:
+                notes.append(f"accessed by 0x{accessor.addr:X}: {accessor.text}  (the CPU stops after the access)")
+            else:
+                notes.append("the CPU stops after the access: the accessing instruction is the one before RIP")
         fpu = evt.fpu_blob if fpu_ok(evt.fpu_blob) else b""     # the event packet carries XMM: no extra request
         self._stale = {"frames", "threads"} | (set() if fpu else {"fpu"})
         took = time.monotonic() - t0
-        root.after(0, lambda: self._show_stop(evt, regs, blob, insns, fpu, took))
+        sel = accessor.addr if accessor is not None else None
+        root.after(0, lambda: self._show_stop(evt, regs, blob, insns, fpu, took, sel))
 
         # 4. only the lower panel that is on screen; the others load when their tab is opened
         self._load_lazy(self._tab_now, gen)
@@ -1399,14 +1423,14 @@ class DebuggerTab:
         return out
 
     def _show_stop(self, evt: StopEvent, regs: dict, blob: bytes, insns: list[Insn], fpu: bytes = b"",
-                   took: float = 0.0) -> None:
+                   took: float = 0.0, select: Optional[int] = None) -> None:
         self.prev_fpu = self.disp_fpu if self.disp_lwp == evt.lwpid else b""
         self.disp_lwp, self.disp_regs, self.disp_blob = evt.lwpid, regs, blob
         self.disp_fpu = fpu
         self._fill_regs(regs, self.prev_regs)
         self._fill_xmm()
         rip = regs["rip"]
-        self.view.load(insns, rip=rip, bps=self.bp_addrs(), select=rip)
+        self.view.load(insns, rip=rip, bps=self.bp_addrs(), select=rip if select is None else select)
         self.view_var.set(f"0x{rip:X}")
 
         # lower panels: cleared now, filled when loaded (the visible one loads right away)
@@ -1830,7 +1854,7 @@ class DebuggerTab:
     # ----------------------------------------------------- code view
     def on_view_go(self) -> None:
         try:
-            self.show_code(self.app.eval_full(self.view_var.get()))
+            self.show_code(self.app.eval_addr(self.view_var.get()))
         except Exception as exc:
             self.app._fail(exc)
 
