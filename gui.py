@@ -686,6 +686,29 @@ class FunctionCallerApp:
         rt.vars["ret"] = self.state.last_rax & 0xFFFFFFFFFFFFFFFF
         return rt.ev(text) & 0xFFFFFFFFFFFFFFFF
 
+    _BARE_HEX = re.compile(r"[0-9A-Fa-f`']+[hH]?")
+    _MOD_OFF = re.compile(r"([^\s+\-*\[\]()@$]+?)\s*\+\s*(?:0[xX])?([0-9A-Fa-f`']+)[hH]?")
+
+    def eval_addr(self, text: str) -> int:
+        """Like eval_full, for fields that take an ADDRESS (breakpoint, Go to, ...).
+
+        Addresses are always hex, so a bare number is read as hex the way every view of the tool shows
+        it ('0000000812345670', '812345670', IDA/WinDbg style '8`12345670' or '812345670h'): eval_full
+        reads digit-only text as DECIMAL, which put a breakpoint typed that way somewhere else.
+        'eboot.bin+0x4561E0' / 'eboot.bin+4561E0' - the module+offset form the tool displays - is
+        module base + offset.  Anything else (0x..., @buf, [ptr], module(x)+..., $var) goes to eval_full."""
+        t = text.strip()
+        if self._BARE_HEX.fullmatch(t) and not t.lower().startswith("0x"):
+            return int(t.rstrip("hH").replace("`", "").replace("'", ""), 16)
+        try:
+            return self.eval_full(t)
+        except Exception:
+            m = self._MOD_OFF.fullmatch(t)
+            if not m:
+                raise
+        base = self.eval_full(f"module({m.group(1)})")
+        return (base + int(m.group(2).replace("`", "").replace("'", ""), 16)) & 0xFFFFFFFFFFFFFFFF
+
     def _build_hex_tab(self, parent: ttk.Frame) -> None:
         bar = ttk.Frame(parent, padding=6)
         bar.pack(fill="x")
