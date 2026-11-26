@@ -19,7 +19,7 @@ from typing import Optional
 import codecave
 import disasm
 from cheats import Cheat, Game, Runtime
-from scrollable import fit_geometry
+from scrollable import ScrollFrame, fit_geometry
 import theme  # noqa: E402
 
 
@@ -71,10 +71,26 @@ class InputsPanel:
         self.d = dialog
         self.state: dict[str, dict] = {k: dict(v) for k, v in (saved or {}).items()}
         self.frame = ttk.LabelFrame(parent, text="Inputs ($name) and buffers (@name) used by the code")
-        self.grid = ttk.Frame(self.frame, padding=(6, 2))
+        # the rows scroll inside a box that grows with them only up to MAX_HEIGHT, so many variables
+        # don't push the code and preview panes below off the window (mouse wheel scrolls it too)
+        self.scroll = ScrollFrame(self.frame, horizontal=False)
+        self.scroll.pack(fill="x")
+        self.grid = ttk.Frame(self.scroll.body, padding=(6, 2))
         self.grid.pack(fill="x")
         self.names: tuple = ()
         self._job = None
+
+    MAX_HEIGHT = 130   # about five rows; more than that scroll
+
+    def _fit_height(self) -> None:
+        """Size the box to its rows, but no taller than MAX_HEIGHT."""
+        try:
+            self.grid.update_idletasks()
+            self.scroll.canvas.configure(height=min(self.grid.winfo_reqheight(), self.MAX_HEIGHT),
+                                         width=self.grid.winfo_reqwidth())   # still ask for the rows' full width
+            self.scroll.canvas.yview_moveto(0)
+        except tk.TclError:
+            pass
 
     # -- names in the code ----------------------------------------------------
     def scan(self) -> tuple[list[str], list[str]]:
@@ -107,6 +123,7 @@ class InputsPanel:
             ttk.Label(self.grid, foreground=theme.c("muted"),
                       text="None yet - write $value or @buf0 in the code and they appear here with a "
                            "type and default value.").grid(row=0, column=0, sticky="w")
+            self._fit_height()
             return
         r = 0
         for n in dollars:
@@ -135,6 +152,7 @@ class InputsPanel:
                       text=(f"session buffer 0x{buf.address:X} is used as it is" if buf
                             else "created when you enable (next to the hook if used as [rip:@name])")).grid(row=r, column=6, sticky="w")
             r += 1
+        self._fit_height()
 
     # -- values ---------------------------------------------------------------
     def inputs(self) -> list[tuple[str, str, str]]:
